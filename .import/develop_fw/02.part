@@ -1,0 +1,403 @@
+MENTAL_MOTION_SAFETY) {
+    retryPolicy.cancel();
+    return;
+  }
+  if (cfg.mode != HALL_CURRENT_FOC) {
+    retryPolicy.cancel();
+    return;
+  }
+
+  const uint32_t now = millis();
+  const float cmd = fabsf(radToRpm(rampedRadPerSec));
+  retryPolicy.observeHealthy(motorEnabled && !safetyFaultLatched &&
+    !reversalPending && cmd >= STALL_MIN_COMMAND_RPM &&
+    safetyHallRpm >= 0.70f * cmd, now);
+  if (!retryPolicy.due(now)) return;
+  if (!motorReady || scheduledRestartAtMs || !safetyFaultLatched) {
+    retryPolicy.cancel();
+    return;
+  }
+  // Driver is already off. Never clear persistent trip while PWM is active.
+  disableMotorNow();
+  if (prefs.putBool("safetytrip", false) == 0) {
+    retryPolicy.cancel();
+    setFault("NVS: retry cancelled; cannot clear stored trip");
+    return;
+  }
+  const float resumePercent = retryPolicy.percent;
+  const int8_t resumeDirection = retryPolicy.direction;
+  retryPolicy.launched();
+  safetyFaultLatched = false;
+  clearFault();
+  resetSCurve(0.0f);
+  motor.target = motor.current_sp = 0.0f;
+  startWaitingAtMs = 0;
+  reversalPending = reversePauseActive = false;
+  requestedPercent = resumePercent;
+  requestedDirection = resumeDirection;
+  Serial.printf("[RECOVERY] Retry %u/%u requested; wait for Hall quiet, then ramp.\n",
+    retryPolicy.attempts, RetryPolicy::maxAttempts);
+}
+
+// ============================================================================
+// 9. PREFERENCES
+// ============================================================================
+
+void saveConfig() {
+  // One NVS blob replaces the multi-key partially-written configuration.
+  if (prefs.putBytes("config6", &cfg, sizeof(cfg)) != sizeof(cfg)) {
+    safetyFaultLatched = true;
+    setFault("NVS: config save failed; restart inhibited until checked");
+  }
+}
+
+void loadConfig() {
+  // NVS migration strategy:
+  // - NEVER discard existing settings just because CONFIG_VERSION changed.
+  // - Existing keys are loaded as-is.
+  // - Any newly introduced/missing key automatically receives its current
+  //   default value.
+  // - After validation, the config is written back with the current version.
+  //
+  // This means a normal firmware update preserves tuning, Hall calibration,
+  // mode and limits. Wi-Fi credentials use separate NVS keys and are also kept.
+  if (prefs.getBytesLength("config6") == sizeof(Config)) {
+    Config saved{};
+    if (prefs.getBytes("config6", &saved, sizeof(saved)) == sizeof(saved) &&
+        saved.version == CONFIG_VERSION) {
+      cfg = saved;
+      validateConfig(cfg);
+      return;
+    }
+  }
+  const Config d = makeDefaultConfig();
+  const uint32_t storedVersion = prefs.getUInt("cfgver", 0);
+
+  cfg.version = CONFIG_VERSION;
+  cfg.mode = prefs.getUChar("mode", d.mode);
+  cfg.maxRpm = prefs.getFloat("maxrpm", d.maxRpm);
+  cfg.minRpm = prefs.getFloat("minrpm", d.minRpm);
+  cfg.accelRpmPerSec = prefs.getFloat("accel", d.accelRpmPerSec);
+  cfg.currentLimitA = prefs.getFloat("curlim", d.currentLimitA);
+  cfg.motorVoltageLimitV = prefs.getFloat("vlim", d.motorVoltageLimitV);
+  cfg.alignVoltageV = prefs.getFloat("alignv", d.alignVoltageV);
+  cfg.currentP = prefs.getFloat("curp", d.currentP);
+  cfg.currentI = prefs.getFloat("curi", d.currentI);
+  cfg.currentTf = prefs.getFloat("curtf", d.currentTf);
+  cfg.velocityP = prefs.getFloat("velp", d.velocityP);
+  cfg.velocityI = prefs.getFloat("veli", d.velocityI);
+  cfg.velocityTf = prefs.getFloat("veltf", d.velocityTf);
+  cfg.defaultReverse = prefs.getBool("defrev", d.defaultReverse);
+  cfg.hallCalValid = prefs.getBool("hvalid", d.hallCalValid);
+  cfg.hallZeroElectric = prefs.getFloat("hzero", d.hallZeroElectric);
+  cfg.hallDirection = prefs.getChar("hdir", d.hallDirection);
+
+  validateConfig(cfg);
+
+  if (storedVersion != CONFIG_VERSION) {
+    Serial.print("NVS config migration: ");
+    Serial.print(storedVersion);
+    Serial.print(" -> ");
+    Serial.println(CONFIG_VERSION);
+    saveConfig();
+  }
+}
+
+// ============================================================================
+// 10. MOTOR SETUP
+// ============================================================================
+
+void applyRuntimeConfig() {
+  validateConfig(cfg);
+
+  motor.updateCurrentLimit(cfg.currentLimitA);
+  motor.updateVoltageLimit(cfg.motorVoltageLimitV);
+  motor.updateVelocityLimit(rpmToRad(cfg.maxRpm));
+
+  motor.PID_current_q.P = cfg.currentP;
+  motor.PID_current_q.I = cfg.currentI;
+  motor.PID_current_q.D = 0.0f;
+  motor.PID_current_d.P = cfg.currentP;
+  motor.PID_current_d.I = cfg.currentI;
+  motor.PID_current_d.D = 0.0f;
+  motor.LPF_current_q.Tf = cfg.currentTf;
+  motor.LPF_current_d.Tf = cfg.currentTf;
+
+  motor.PID_velocity.P = cfg.velocityP;
+  motor.PID_velocity.I = cfg.velocityI;
+  motor.PID_velocity.D = 0.0f;
+  motor.LPF_velocity.Tf = cfg.velocityTf;
+
+  // Do not touch Hall runtime state in OPEN commissioning mode.
+  if (cfg.mode == HALL_CURRENT_FOC) {
+    hall.velocity_max = max(rpmToRad(cfg.maxRpm) * 1.7f, 150.0f);
+  }
+
+  resetControlLoops();
+}
+
+bool setupMotor() {
+  clearFault();
+  if (ENABLE_EXPERIMENTAL_MOTION_SAFETY && prefs.getBool("safetytrip", false)) {
+    setFault("PREVIOUS_FAULT: inspect hardware, clear to reinitialize");
+    return false;
+  }
+
+  // Exact pre-driver state used by the known-good no-Hall v0.3.7 path.
+  // The bridge remains disabled through PIN_ENABLE, while all PWM inputs are
+  // held LOW until SimpleFOC configures the PWM hardware.
+  pinMode(PIN_PWM_U, OUTPUT);
+  pinMode(PIN_PWM_V, OUTPUT);
+  pinMode(PIN_PWM_W, OUTPUT);
+  digitalWrite(PIN_PWM_U, LOW);
+  digitalWrite(PIN_PWM_V, LOW);
+  digitalWrite(PIN_PWM_W, LOW);
+
+  // Motor parameters used by SimpleFOC 2.4 current-control compensation.
+  // Do not enable model compensation with unverified phase/line parameters.
+  // Current PI runs directly on measured phase currents.
+
+
+  // Explicitly initialise v2.4 feed-forward state. Global objects are normally
+  // zero-initialised already, but doing it here removes any ambiguity.
+  motor.feed_forward_current.q = 0.0f;
+  motor.feed_forward_current.d = 0.0f;
+  motor.feed_forward_voltage.q = 0.0f;
+  motor.feed_forward_voltage.d = 0.0f;
+  motor.feed_forward_velocity = 0.0f;
+
+  // Hall is intentionally absent from OPEN_CURRENT_FOC: no init, interrupts,
+  // startup gate, telemetry or watchdog dependency. This makes OPEN mode a real
+  // Hall-free test mode. HALL mode keeps the full sensor path.
+  if (cfg.mode == HALL_CURRENT_FOC) {
+    hall.pullup = Pullup::USE_EXTERN;
+    hall.velocity_max = max(rpmToRad(cfg.maxRpm) * 1.7f, 150.0f);
+    hall.init();
+    lastHallState = readHallState();
+    lastHallEdgeUs = micros();
+    hall.enableInterrupts(doHallA, doHallB, doHallC);
+    motor.linkSensor(&hall);
+
+    // Keep the Hall safety gate available for later qualification, but do not
+    // let it participate during current no-Hall commissioning.
+    if (ENABLE_EXPERIMENTAL_MOTION_SAFETY) {
+      const uint32_t waitStart = millis();
+      while (hallQuietUs() < START_QUIET_US) {
+        if (millis() - waitStart >= START_WAIT_LIMIT_MS) {
+          setFault("WINDMILL: cannot initialize Hall FOC while rotor is moving");
+          return false;
+        }
+        delay(1);
+      }
+      const uint8_t initialHall = readHallState();
+      if (initialHall == 0 || initialHall == 7) {
+        setFault("HALL_INVALID: check Hall wiring before Hall FOC initialization");
+        return false;
+      }
+    }
+  } else {
+    hallWatchdogEnabled = false;
+    hallTransitions = 0;
+    safetyHallRpm = 0.0f;
+    Serial.println("OPEN_CURRENT_FOC: Hall hardware is NOT used.");
+  }
+  driver.pwm_frequency = 25000;
+  driver.voltage_power_supply = SUPPLY_VOLTAGE_V;
+  driver.voltage_limit = HARD_DRIVER_VOLTAGE_LIMIT_V;
+
+  if (!driver.init()) {
+    setFault("Driver init failed");
+    return false;
+  }
+  motor.linkDriver(&driver);
+
+  motor.foc_modulation = FOCModulationType::SinePWM;
+  motor.torque_controller = TorqueControlType::foc_current;
+  motor.controller = (cfg.mode == HALL_CURRENT_FOC)
+    ? MotionControlType::velocity
+    : MotionControlType::velocity_openloop;
+
+  motor.current_limit = cfg.currentLimitA;
+  motor.voltage_limit = cfg.motorVoltageLimitV;
+  motor.velocity_limit = rpmToRad(cfg.maxRpm);
+  motor.voltage_sensor_align = cfg.alignVoltageV;
+
+  motor.PID_current_q.P = cfg.currentP;
+  motor.PID_current_q.I = cfg.currentI;
+  motor.PID_current_q.D = 0.0f;
+  motor.PID_current_d.P = cfg.currentP;
+  motor.PID_current_d.I = cfg.currentI;
+  motor.PID_current_d.D = 0.0f;
+  motor.LPF_current_q.Tf = cfg.currentTf;
+  motor.LPF_current_d.Tf = cfg.currentTf;
+
+  motor.PID_velocity.P = cfg.velocityP;
+  motor.PID_velocity.I = cfg.velocityI;
+  motor.PID_velocity.D = 0.0f;
+  motor.LPF_velocity.Tf = cfg.velocityTf;
+
+  if (!motor.init()) {
+    motor.disable();
+    setFault("Motor init failed");
+    return false;
+  }
+
+  // Must be linked to the initialized driver before current-sense init.
+  currentSense.linkDriver(&driver);
+
+  if (!currentSense.init()) {
+    setFault("Current sense init failed");
+    motor.disable();
+    return false;
+  }
+
+  // Check current phase order/sign at initialization; offsets calibrate every boot.
+  currentSense.skip_align = SKIP_CURRENT_SENSE_ALIGNMENT;
+  motor.linkCurrentSense(&currentSense);
+
+  bool usedSavedHallCalibration = false;
+  if (cfg.mode == HALL_CURRENT_FOC && cfg.hallCalValid) {
+    motor.zero_electric_angle = cfg.hallZeroElectric;
+    motor.sensor_direction = (cfg.hallDirection > 0) ? Direction::CW : Direction::CCW;
+    usedSavedHallCalibration = true;
+    Serial.println("Using saved Hall FOC calibration.");
+  }
+
+  Serial.printf("initFOC: mode=%s, Hall=%s, currentSense=GPIO%d/GPIO%d, align=%.2f V, skipCurrentAlign=%s\n",
+                cfg.mode == OPEN_CURRENT_FOC ? "OPEN_CURRENT_FOC" : "HALL_CURRENT_FOC",
+                cfg.mode == OPEN_CURRENT_FOC ? "UNUSED" : "ACTIVE",
+                PIN_CURRENT_A, PIN_CURRENT_B, cfg.alignVoltageV,
+                SKIP_CURRENT_SENSE_ALIGNMENT ? "true" : "false");
+
+  if (!motor.initFOC()) {
+    if (cfg.mode == OPEN_CURRENT_FOC)
+      setFault("OPEN initFOC failed - current-sense alignment failed (Hall unused)");
+    else
+      setFault("HALL initFOC failed - check Hall/current-sense alignment");
+    motor.disable();
+    return false;
+  }
+
+  motor.disable();
+
+  if (cfg.mode == HALL_CURRENT_FOC && !usedSavedHallCalibration) {
+    cfg.hallCalValid = true;
+    cfg.hallZeroElectric = motor.zero_electric_angle;
+    cfg.hallDirection = (motor.sensor_direction == Direction::CW) ? 1 : -1;
+    saveConfig();
+
+    Serial.print("Saved Hall zero_electric_angle = ");
+    Serial.println(cfg.hallZeroElectric, 6);
+    Serial.print("Saved Hall direction = ");
+    Serial.println(cfg.hallDirection > 0 ? "CW" : "CCW");
+  }
+
+  applyRuntimeConfig();
+
+  // NEVER auto-start after boot.
+  requestedPercent = 0.0f;
+  requestedDirection = cfg.defaultReverse ? -1 : 1;
+  driveDirection = requestedDirection;
+  resetSCurve(0.0f);
+  motor.target = 0.0f;
+  motor.disable();
+  motorEnabled = false;
+  controlTimestampUs = micros();
+
+  Serial.println("Motor initialized and disabled (safe stop).");
+  return true;
+}
+
+// ============================================================================
+// 11. MOTOR CONTROL LOOP + STALL / OVERLOAD SAFETY
+// ============================================================================
+
+void runSafetyMonitor() {
+  if (!ENABLE_EXPERIMENTAL_MOTION_SAFETY) return;
+  if (!motorReady || !motorEnabled || safetyFaultLatched) return;
+  if (!hallWatchdogEnabled) return; // OPEN mode has no Hall dependency.
+
+  const uint32_t now = millis();
+  if (now - lastSafetyCheckMs < SAFETY_CHECK_PERIOD_MS) return;
+  lastSafetyCheckMs = now;
+
+  const uint32_t hc = hallTransitions;
+  if (hc != lastHallCount) {
+    lastHallCount = hc;
+    lastHallActivityMs = now;
+  }
+  safetyHallRpm = fabsf(radToRpm(hall.getVelocity()));
+
+  // Do not diagnose commanded deceleration/reversal as a stall/overload.
+  if (requestedPercent <= 0.01f || reversalPending || reversePauseActive) {
+    overloadStartedMs = 0;
+    return;
+  }
+
+  const uint32_t runMs = now - motorEnabledAtMs;
+  if (runMs < STALL_STARTUP_GRACE_MS) {
+    overloadStartedMs = 0;
+    return;
+  }
+
+  const float commandRpm = fabsf(radToRpm(rampedRadPerSec));
+  if (commandRpm < STALL_MIN_COMMAND_RPM) {
+    overloadStartedMs = 0;
+    return;
+  }
+
+  const uint32_t quietMs = now - lastHallActivityMs;
+  if (quietMs >= STALL_NO_HALL_TIMEOUT_MS) {
+    tripSafetyFault("STALL", "no Hall motion while torque is commanded");
+    return;
+  }
+
+  const float speedRatio = (commandRpm > 1.0f) ? safetyHallRpm / commandRpm : 1.0f;
+  const float iq = fabsf(motor.current.q);
+  const bool overloaded =
+    speedRatio < OVERLOAD_MIN_SPEED_RATIO &&
+    iq >= cfg.currentLimitA * OVERLOAD_CURRENT_RATIO;
+
+  if (overloaded) {
+    if (overloadStartedMs == 0) overloadStartedMs = now;
+    if (now - overloadStartedMs >= OVERLOAD_HOLD_MS) {
+      tripSafetyFault("OVERLOAD", "low RPM + high current persisted");
+      return;
+    }
+  } else {
+    overloadStartedMs = 0;
+  }
+}
+
+// Coast before STOP/reverse. Never infer physical standstill from ramped target.
+void runMotorControl() {
+  if (!motorReady) return;
+
+  if (safetyFaultLatched || scheduledRestartAtMs) {
+    requestedPercent = 0.0f;
+    resetSCurve(0.0f);
+    disableMotorNow();
+    return;
+  }
+
+  const uint32_t nowUs = micros();
+  const uint32_t elapsedUs = nowUs - controlTimestampUs;
+  controlTimestampUs = nowUs;
+  if (elapsedUs > loopGapWindowMaxUs) loopGapWindowMaxUs = elapsedUs;
+  if (ENABLE_EXPERIMENTAL_MOTION_SAFETY &&
+      motorEnabled && elapsedUs > LOOP_GAP_LIMIT_US) {
+    tripSafetyFault("LOOP_GAP", "motor loop exceeded 10 ms");
+    return;
+  }
+
+  if (cfg.mode == HALL_CURRENT_FOC) {
+    hall.update();
+    safetyHallRpm = fabsf(radToRpm(hall.getVelocity()));
+  } else {
+    safetyHallRpm = 0.0f;
+  }
+
+  const bool stopRequested = requestedPercent <= 0.01f;
+
+  // OPEN mode: direction is simply the sign of the velocity target.  SimpleFOC
+  // velocity_openloop natively accepts negative velocity.  Keeping 
