@@ -1,0 +1,412 @@
+========================================================================
+
+bool motorReady = false;
+bool motorEnabled = false;
+bool reversalPending = false;
+bool reversePauseActive = false;
+
+float requestedPercent = 0.0f;
+int8_t requestedDirection = 1;
+int8_t driveDirection = 1;
+float rampedRadPerSec = 0.0f;
+uint32_t controlTimestampUs = 0;
+uint32_t startWaitingAtMs = 0;
+uint32_t overCurrentAtMs = 0;
+uint32_t invalidHallAtMs = 0;
+static constexpr uint32_t START_QUIET_US = 500000;
+static constexpr uint32_t START_WAIT_LIMIT_MS = 10000;
+static constexpr uint32_t REVERSE_COAST_MS = 500;
+static constexpr uint32_t LOOP_GAP_LIMIT_US = 10000;
+static constexpr uint32_t OVERCURRENT_HOLD_MS = 20;
+
+// Safety watchdog runtime state. Faults are latched: once a stall/overload is
+// detected the driver is disabled immediately. Bounded recovery retries
+// STALL/OVERLOAD; all other faults require explicit clear.
+bool safetyFaultLatched = false;
+RetryPolicy retryPolicy;
+bool hallWatchdogEnabled = false;
+uint32_t motorEnabledAtMs = 0;
+uint32_t lastHallCount = 0;
+uint32_t lastHallActivityMs = 0;
+uint32_t overloadStartedMs = 0;
+uint32_t lastSafetyCheckMs = 0;
+float safetyHallRpm = 0.0f;
+
+char faultText[96] = "";
+
+uint32_t scheduledRestartAtMs = 0;
+
+// ============================================================================
+// 8. HELPERS
+// ============================================================================
+
+static inline float rpmToRad(float rpm) {
+  return rpm * (_2PI / 60.0f);
+}
+
+static inline float radToRpm(float rad_s) {
+  return rad_s * (60.0f / _2PI);
+}
+
+static inline float clampf(float x, float lo, float hi) {
+  if (!isfinite(x)) return lo;
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+void setFault(const char* msg) {
+  strncpy(faultText, msg ? msg : "", sizeof(faultText) - 1);
+  faultText[sizeof(faultText) - 1] = '\0';
+  Serial.print("FAULT: ");
+  Serial.println(faultText);
+}
+
+void clearFault() {
+  faultText[0] = '\0';
+}
+
+void validateConfig(Config& c) {
+  c.version = CONFIG_VERSION;
+  c.mode = (c.mode == HALL_CURRENT_FOC) ? HALL_CURRENT_FOC : OPEN_CURRENT_FOC;
+
+  c.maxRpm = clampf(c.maxRpm, 100.0f, HARD_MAX_RPM);
+  c.minRpm = clampf(c.minRpm, 50.0f, c.maxRpm);
+  c.accelRpmPerSec = clampf(c.accelRpmPerSec, 50.0f, 5000.0f);
+
+  c.currentLimitA = clampf(c.currentLimitA, 0.10f, HARD_MAX_CURRENT_A);
+  c.motorVoltageLimitV = clampf(c.motorVoltageLimitV, 0.50f, HARD_MAX_MOTOR_VOLTAGE_V);
+  c.alignVoltageV = clampf(c.alignVoltageV, 0.20f, HARD_MAX_ALIGN_VOLTAGE_V);
+  if (c.alignVoltageV > c.motorVoltageLimitV) c.alignVoltageV = c.motorVoltageLimitV;
+
+  c.currentP = clampf(c.currentP, 0.01f, 2.0f);
+  c.currentI = clampf(c.currentI, 1.0f, 1000.0f);
+  c.currentTf = clampf(c.currentTf, 0.0005f, 0.020f);
+
+  c.velocityP = clampf(c.velocityP, 0.0001f, 0.100f);
+  c.velocityI = clampf(c.velocityI, 0.0f, 2.0f);
+  c.velocityTf = clampf(c.velocityTf, 0.001f, 0.100f);
+
+  if (!isfinite(c.hallZeroElectric) || c.hallZeroElectric < 0.0f ||
+      c.hallZeroElectric >= _2PI ||
+      (c.hallDirection != -1 && c.hallDirection != 1)) {
+    c.hallCalValid = false;
+    c.hallZeroElectric = 0.0f;
+    c.hallDirection = 1;
+  }
+}
+
+String jsonEscape(const char* s) {
+  String out;
+  if (!s) return out;
+  while (*s) {
+    char ch = *s++;
+    switch (ch) {
+      case '\\': out += "\\\\"; break;
+      case '"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if ((uint8_t)ch >= 0x20) out += ch;
+        break;
+    }
+  }
+  return out;
+}
+
+float rampToward(float value, float target, float maxStep) {
+  if (value < target) return min(value + maxStep, target);
+  if (value > target) return max(value - maxStep, target);
+  return value;
+}
+
+void resetControlLoops() {
+  motor.PID_velocity.reset();
+  motor.PID_current_q.reset();
+  motor.PID_current_d.reset();
+}
+
+void disableMotorNow() {
+  if (motorEnabled) motor.disable();
+  digitalWrite(PIN_ENABLE, LOW);
+  motorEnabled = false;
+  overloadStartedMs = 0;
+  resetControlLoops();
+}
+
+void resetSafetyWatchdogForStart() {
+  const uint32_t now = millis();
+  motorEnabledAtMs = now;
+  lastHallCount = hallTransitions;
+  lastHallActivityMs = now;
+  overloadStartedMs = 0;
+  lastSafetyCheckMs = 0;
+  safetyHallRpm = 0.0f;
+
+  // Hall watchdog exists only in HALL_CURRENT_FOC.
+  // OPEN_CURRENT_FOC is intentionally completely Hall-independent.
+  hallWatchdogEnabled = ENABLE_EXPERIMENTAL_MOTION_SAFETY &&
+                        (cfg.mode == HALL_CURRENT_FOC);
+}
+
+void enableMotorNow() {
+  if (!motorReady || motorEnabled || safetyFaultLatched) return;
+  resetControlLoops();
+  resetSafetyWatchdogForStart();
+  motor.current_sp = 0.0f;
+  motor.target = 0.0f;
+  motor.enable();
+  motorEnabled = true;
+}
+
+void tripSafetyFault(const char* code, const char* reason) {
+  if (!ENABLE_EXPERIMENTAL_MOTION_SAFETY) return;
+  if (safetyFaultLatched) return;
+
+  const float cmdRpm = fabsf(radToRpm(rampedRadPerSec));
+  const float hallRpm = fabsf(safetyHallRpm);
+  const float iq = motorEnabled ? fabsf(motor.current.q) : 0.0f;
+  const uint32_t quietMs = millis() - lastHallActivityMs;
+
+  const bool retryScheduled = retryPolicy.schedule(code, requestedPercent,
+    requestedDirection, cfg.mode == HALL_CURRENT_FOC, millis());
+  safetyFaultLatched = true;
+  requestedPercent = 0.0f;
+  rampedRadPerSec = 0.0f;
+  motor.target = 0.0f;
+  disableMotorNow();
+
+  reversalPending = false;
+  reversePauseActive = false;
+  startWaitingAtMs = 0;
+  prefs.putBool("safetytrip", true); // power cycling does not clear a fault
+  snprintf(faultText, sizeof(faultText), "%s: %s", code, reason);
+
+  // One clear event, no Serial flooding.
+  Serial.println();
+  Serial.println("================ SAFETY FAULT ================");
+  Serial.print("Code: "); Serial.println(code);
+  Serial.print("Reason: "); Serial.println(reason);
+  Serial.printf("Commanded: %.0f rpm | Hall: %.0f rpm | Iq: %.3f A\n",
+                cmdRpm, hallRpm, iq);
+  Serial.printf("No Hall transition: %lu ms | Hall transitions: %lu\n",
+                (unsigned long)quietMs, (unsigned long)hallTransitions);
+  if (retryScheduled) {
+    Serial.printf("Driver OFF. Automatic retry %u/%u in 10 seconds; STOP cancels.\n",
+      retryPolicy.attempts + 1, RetryPolicy::maxAttempts);
+  } else {
+    Serial.println("Driver OFF. Manual clear required (hard fault or retries exhausted).");
+  }
+  Serial.println("Manual clear stops retries: GUI Clear fault / Serial clear");
+  Serial.println("==============================================");
+}
+
+void clearSafetyFault() {
+  retryPolicy.reset();
+  if (!safetyFaultLatched) return;
+  requestedPercent = 0.0f;
+  rampedRadPerSec = 0.0f;
+  disableMotorNow();
+  if (prefs.putBool("safetytrip", false) == 0) {
+    setFault("NVS: cannot clear persisted fault");
+    return;
+  }
+  safetyFaultLatched = false;
+  reversalPending = reversePauseActive = false;
+  startWaitingAtMs = 0;
+  hallWatchdogEnabled = false;
+  overloadStartedMs = 0;
+  clearFault();
+  Serial.println("[SAFETY] Fault cleared. Motor remains STOPPED.");
+  if (!motorReady) {
+    // Explicit clear after a persisted fault permits initialization on reboot.
+    scheduledRestartAtMs = millis() + 600;
+  }
+}
+
+void serviceAutoRecovery() {
+  if (!ENABLE_EXPERIMENTAL_MOTION_SAFETY) {
+    retryPolicy.cancel();
+    return;
+  }
+  if (cfg.mode != HALL_CURRENT_FOC) {
+    retryPolicy.cancel();
+    return;
+  }
+
+  const uint32_t now = millis();
+  const float cmd = fabsf(radToRpm(rampedRadPerSec));
+  retryPolicy.observeHealthy(motorEnabled && !safetyFaultLatched &&
+    !reversalPending && cmd >= STALL_MIN_COMMAND_RPM &&
+    safetyHallRpm >= 0.70f * cmd, now);
+  if (!retryPolicy.due(now)) return;
+  if (!motorReady || scheduledRestartAtMs || !safetyFaultLatched) {
+    retryPolicy.cancel();
+    return;
+  }
+  // Driver is already off. Never clear persistent trip while PWM is active.
+  disableMotorNow();
+  if (prefs.putBool("safetytrip", false) == 0) {
+    retryPolicy.cancel();
+    setFault("NVS: retry cancelled; cannot clear stored trip");
+    return;
+  }
+  const float resumePercent = retryPolicy.percent;
+  const int8_t resumeDirection = retryPolicy.direction;
+  retryPolicy.launched();
+  safetyFaultLatched = false;
+  clearFault();
+  rampedRadPerSec = 0.0f;
+  motor.target = motor.current_sp = 0.0f;
+  startWaitingAtMs = 0;
+  reversalPending = reversePauseActive = false;
+  requestedPercent = resumePercent;
+  requestedDirection = resumeDirection;
+  Serial.printf("[RECOVERY] Retry %u/%u requested; wait for Hall quiet, then ramp.\n",
+    retryPolicy.attempts, RetryPolicy::maxAttempts);
+}
+
+// ============================================================================
+// 9. PREFERENCES
+// ============================================================================
+
+void saveConfig() {
+  // One NVS blob replaces the multi-key partially-written configuration.
+  if (prefs.putBytes("config6", &cfg, sizeof(cfg)) != sizeof(cfg)) {
+    safetyFaultLatched = true;
+    setFault("NVS: config save failed; restart inhibited until checked");
+  }
+}
+
+void loadConfig() {
+  // Preferred format: one configuration blob.
+  //
+  // If the stored blob has the same struct size, load it even if its version
+  // differs. validateConfig() applies current safe bounds and the blob is then
+  // rewritten with CONFIG_VERSION. This prevents ordinary firmware upgrades
+  // from losing valid tuning solely because the schema version changed.
+  //
+  // If no compatible blob exists, import the legacy individual NVS keys once.
+  const size_t blobLength = prefs.getBytesLength("config6");
+
+  if (blobLength == sizeof(Config)) {
+    Config saved{};
+
+    if (prefs.getBytes("config6", &saved, sizeof(saved)) == sizeof(saved)) {
+      const uint32_t oldVersion = saved.version;
+      cfg = saved;
+      validateConfig(cfg);
+
+      if (oldVersion != CONFIG_VERSION) {
+        Serial.printf("NVS blob migration: %lu -> %lu\n",
+                      (unsigned long)oldVersion,
+                      (unsigned long)CONFIG_VERSION);
+        saveConfig();
+      }
+      return;
+    }
+  }
+
+  const Config d = makeDefaultConfig();
+
+  cfg.version = CONFIG_VERSION;
+  cfg.mode = prefs.getUChar("mode", d.mode);
+  cfg.maxRpm = prefs.getFloat("maxrpm", d.maxRpm);
+  cfg.minRpm = prefs.getFloat("minrpm", d.minRpm);
+  cfg.accelRpmPerSec = prefs.getFloat("accel", d.accelRpmPerSec);
+  cfg.currentLimitA = prefs.getFloat("curlim", d.currentLimitA);
+  cfg.motorVoltageLimitV = prefs.getFloat("vlim", d.motorVoltageLimitV);
+  cfg.alignVoltageV = prefs.getFloat("alignv", d.alignVoltageV);
+  cfg.currentP = prefs.getFloat("curp", d.currentP);
+  cfg.currentI = prefs.getFloat("curi", d.currentI);
+  cfg.currentTf = prefs.getFloat("curtf", d.currentTf);
+  cfg.velocityP = prefs.getFloat("velp", d.velocityP);
+  cfg.velocityI = prefs.getFloat("veli", d.velocityI);
+  cfg.velocityTf = prefs.getFloat("veltf", d.velocityTf);
+  cfg.defaultReverse = prefs.getBool("defrev", d.defaultReverse);
+  cfg.hallCalValid = prefs.getBool("hvalid", d.hallCalValid);
+  cfg.hallZeroElectric = prefs.getFloat("hzero", d.hallZeroElectric);
+  cfg.hallDirection = prefs.getChar("hdir", d.hallDirection);
+
+  validateConfig(cfg);
+  Serial.println("NVS: imported legacy/default configuration.");
+  saveConfig();
+}
+
+// ============================================================================
+// 10. MOTOR SETUP
+// ============================================================================
+
+void applyRuntimeConfig() {
+  validateConfig(cfg);
+
+  motor.updateCurrentLimit(cfg.currentLimitA);
+  motor.updateVoltageLimit(cfg.motorVoltageLimitV);
+  motor.updateVelocityLimit(rpmToRad(cfg.maxRpm));
+
+  motor.PID_current_q.P = cfg.currentP;
+  motor.PID_current_q.I = cfg.currentI;
+  motor.PID_current_q.D = 0.0f;
+  motor.PID_current_d.P = cfg.currentP;
+  motor.PID_current_d.I = cfg.currentI;
+  motor.PID_current_d.D = 0.0f;
+  motor.LPF_current_q.Tf = cfg.currentTf;
+  motor.LPF_current_d.Tf = cfg.currentTf;
+
+  motor.PID_velocity.P = cfg.velocityP;
+  motor.PID_velocity.I = cfg.velocityI;
+  motor.PID_velocity.D = 0.0f;
+  motor.LPF_velocity.Tf = cfg.velocityTf;
+
+  // Hall runtime configuration is touched only in Hall mode.
+  if (cfg.mode == HALL_CURRENT_FOC) {
+    hall.velocity_max = max(rpmToRad(cfg.maxRpm) * 1.7f, 150.0f);
+  }
+
+  resetControlLoops();
+}
+
+bool setupMotor() {
+  clearFault();
+  if (ENABLE_EXPERIMENTAL_MOTION_SAFETY && prefs.getBool("safetytrip", false)) {
+    setFault("PREVIOUS_FAULT: inspect hardware, clear to reinitialize");
+    return false;
+  }
+
+  // Hold all driver inputs inactive until SimpleFOC configures PWM.
+  pinMode(PIN_PWM_U, OUTPUT);
+  pinMode(PIN_PWM_V, OUTPUT);
+  pinMode(PIN_PWM_W, OUTPUT);
+  digitalWrite(PIN_PWM_U, LOW);
+  digitalWrite(PIN_PWM_V, LOW);
+  digitalWrite(PIN_PWM_W, LOW);
+  // Torque control uses physical inline phase-current feedback.
+  // No estimated-current/model-based torque controller is used.
+
+
+  // Explicitly initialise v2.4 feed-forward state. Global objects are normally
+  // zero-initialised already, but doing it here removes any ambiguity.
+  motor.feed_forward_current.q = 0.0f;
+  motor.feed_forward_current.d = 0.0f;
+  motor.feed_forward_voltage.q = 0.0f;
+  motor.feed_forward_voltage.d = 0.0f;
+  motor.feed_forward_velocity = 0.0f;
+
+  // TRUE HALL-INDEPENDENT OPEN LOOP:
+  // Do not even initialise or read Hall GPIOs unless HALL_CURRENT_FOC is active.
+  if (cfg.mode == HALL_CURRENT_FOC) {
+    hall.pullup = Pullup::USE_EXTERN;
+    hall.velocity_max = max(rpmToRad(cfg.maxRpm) * 1.7f, 150.0f);
+    hall.init();
+    lastHallState = readHallState();
+    lastHallEdgeUs = micros();
+    hall.enableInterrupts(doHallA, doHallB, doHallC);
+    motor.linkSensor(&hall);
+
+    // Reserved for a future safety pass. Do not block current commissioning
+    // on a noisy/moving Hall input.
+    if (ENABLE_EXPERIMENTAL_MOTION_SAFETY) {
+      const uint32_t waitStart = millis();
+      while (hallQuietUs() < START_QUIET_US) {
+        if (millis() - waitStart >= START_WAIT_LIMIT_MS) {
