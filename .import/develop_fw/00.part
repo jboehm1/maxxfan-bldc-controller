@@ -1,0 +1,427 @@
+/*
+  ============================================================================
+  MaxxFan BLDC Controller - v0.3.6.3 DECOUPLED-GUI NOHALL
+  Board : MKS ESP32 FOC Mega (single motor)
+  Motor : StepperOnline 57BYA54-12-01
+  Library: SimpleFOC 2.4.0
+
+  Control modes:
+    0) OPEN_CURRENT_FOC
+       MotionControlType::velocity_openloop + TorqueControlType::foc_current
+       - physical phase-current feedback
+       - NO Hall initialization or rotor-position feedback
+
+    1) HALL_CURRENT_FOC
+       MotionControlType::velocity + TorqueControlType::foc_current
+       - physical phase-current feedback
+       - Hall rotor feedback
+
+  Important hardware mapping used by the supplied MKS Mega examples:
+    PWM U/V/W  : GPIO 32 / 33 / 25
+    ENABLE     : GPIO 12  <-- confirmed by the user's working Mega setup
+    Hall A/B/C : GPIO 18 / 19 / 15
+    Current A/B: GPIO 39 / 36
+    Shunt      : 0.01 ohm
+    Gain       : 50 V/V
+
+  IMPORTANT:
+  - This sketch deliberately DOES NOT read VIN on GPIO13 while Wi-Fi is active.
+    GPIO13 is ADC2 on classic ESP32 and can conflict with Wi-Fi/ADC use.
+  - No RUN command is restored at boot. Electrical alignment can move the rotor.
+  - Hall calibration is saved after the first successful Hall initFOC().
+  - Current phase alignment is enabled; initialization may move the rotor.
+  - GUI telemetry transmission is intentionally suspended while PWM is active.
+  - GUI control commands are coalesced and applied after an 80 ms network-quiet window.
+  - In OPEN mode, direction reversal is one continuous signed S-curve; EN stays ON.
+    This restores the timing behavior of the known-smooth v0.3.7 reference: the
+    browser can still command the fan, but periodic network traffic is not generated
+    from the motor loop while the motor is running/ramping/reversing.
+  - Final source candidate: hardware behavior must still be verified on your exact board/motor.
+  ============================================================================
+*/
+
+#include <Arduino.h>
+#include <math.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <SimpleFOC.h>
+#include <WiFi.h>
+#include <Preferences.h>
+#include <ESPmDNS.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+
+// Forward declarations for Arduino's .ino auto-prototype generator.
+// Without these, Arduino can emit prototypes using these custom types
+// before their full struct definitions, causing e.g.:
+//   'Telemetry' does not name a type
+struct Config;
+struct Telemetry;
+
+// ============================================================================
+// Local retry policy (kept in this .ino: no extra header/library required)
+// ============================================================================
+struct RetryPolicy {
+  static constexpr uint32_t cooldownMs = 10000;
+  static constexpr uint8_t maxAttempts = 3;
+  static constexpr uint32_t healthyResetMs = 60000;
+
+  bool pending = false;
+  uint8_t attempts = 0;
+  uint32_t scheduledAt = 0;
+  uint32_t healthyAt = 0;
+  bool trackingHealthy = false;
+  float percent = 0.0f;
+  int8_t direction = 1;
+
+  void cancel() {
+    pending = false;
+    percent = 0.0f;
+    trackingHealthy = false;
+  }
+
+  void reset() {
+    cancel();
+    attempts = 0;
+  }
+
+  bool schedule(const char* code, float request, int8_t dir,
+                bool hallAvailable, uint32_t now) {
+    cancel();
+    if (!code || (strcmp(code, "STALL") && strcmp(code, "OVERLOAD")) ||
+        !hallAvailable || request <= 0.0f || attempts >= maxAttempts) {
+      return false;
+    }
+    percent = request;
+    direction = dir;
+    scheduledAt = now;
+    pending = true;
+    return true;
+  }
+
+  uint32_t remainingMs(uint32_t now) const {
+    if (!pending) return 0;
+    const uint32_t elapsed = now - scheduledAt;
+    return elapsed >= cooldownMs ? 0 : cooldownMs - elapsed;
+  }
+
+  bool due(uint32_t now) const {
+    return pending && remainingMs(now) == 0;
+  }
+
+  void launched() {
+    pending = false;
+    ++attempts;
+    trackingHealthy = false;
+  }
+
+  void observeHealthy(bool healthy, uint32_t now) {
+    if (!healthy) {
+      trackingHealthy = false;
+      return;
+    }
+    if (!trackingHealthy) {
+      trackingHealthy = true;
+      healthyAt = now;
+    }
+    if (now - healthyAt >= healthyResetMs) {
+      attempts = 0;
+    }
+  }
+};
+
+// ============================================================================
+// 1. HARDWARE - CHANGE ONLY IF YOUR BOARD REVISION REQUIRES IT
+// ============================================================================
+
+static constexpr int PIN_PWM_U = 32;
+static constexpr int PIN_PWM_V = 33;
+static constexpr int PIN_PWM_W = 25;
+static constexpr int PIN_ENABLE = 12;
+
+static constexpr int PIN_HALL_A = 18;
+static constexpr int PIN_HALL_B = 19;
+static constexpr int PIN_HALL_C = 15;
+
+static constexpr int PIN_CURRENT_A = 39;
+static constexpr int PIN_CURRENT_B = 36;
+
+static constexpr int MOTOR_POLE_PAIRS = 2;
+
+// 57BYA54-12-01 datasheet values
+static constexpr float MOTOR_PHASE_RESISTANCE_OHM = 0.27f;
+static constexpr float MOTOR_PHASE_INDUCTANCE_H = 0.00057f;
+
+static constexpr float SUPPLY_VOLTAGE_V = 12.0f;
+static constexpr float CURRENT_SHUNT_OHM = 0.01f;
+static constexpr float CURRENT_AMP_GAIN = 50.0f;
+
+// Validate phase correspondence at initFOC rather than assuming board wiring.
+// Alignment applies phase voltage and can move the rotor at boot.
+// Never skip based only on an example for a different board revision.
+static constexpr bool SKIP_CURRENT_SENSE_ALIGNMENT = false;
+
+// ============================================================================
+// 2. ABSOLUTE SAFETY CEILINGS
+//    GUI / NVS values are clamped below these values.
+//    Driver uses full bus for PWM centering. Each d/q voltage is <=3 V;
+//    vector magnitude <=sqrt(2)*3 V, below the 6 V half-bus at nominal 12 V.
+// ============================================================================
+
+static constexpr float HARD_MAX_CURRENT_A = 2.0f;
+static constexpr float HARD_MAX_MOTOR_VOLTAGE_V = 3.0f;
+static constexpr float HARD_DRIVER_VOLTAGE_LIMIT_V = SUPPLY_VOLTAGE_V;
+static constexpr float HARD_MAX_RPM = 3000.0f;
+static constexpr float HARD_MAX_ALIGN_VOLTAGE_V = 1.2f;
+
+// STOP releases the driver; physical coast-down is observed before restarting.
+
+// Normal speed changes, STOP and reversal use a monotonic quintic S-curve.
+// cfg.accelRpmPerSec is kept internally for NVS compatibility; the GUI exposes
+// the equivalent full 0->100% ramp time because it is easier to tune.
+static constexpr uint32_t SCURVE_MIN_DURATION_US = 250000;  // 250 ms for tiny changes
+static constexpr uint32_t SCURVE_MAX_DURATION_US = 8000000; // sanity ceiling
+static constexpr float SCURVE_ZERO_EPS_RAD_S = 0.05f;
+static constexpr uint32_t OPEN_REVERSE_PAUSE_MS = 350;
+
+// OPEN + foc_current has a subtle property in SimpleFOC: velocityOpenloop()
+// returns current_limit even at 0 rad/s. Therefore cutting EN exactly at zero
+// can release a still-energised stator field and make an audible click. Fade the
+// current setpoint smoothly before disabling, and fade it in after enabling.
+static constexpr uint32_t OPEN_CURRENT_FADE_IN_US = 180000;
+static constexpr uint32_t OPEN_CURRENT_FADE_OUT_US = 140000;
+
+// GUI commands are received by AsyncTCP/WebServer on an asynchronous network
+// task.  Do not retarget the motor in the same burst that parses and ACKs the
+// HTTP request.  Keep only the newest GUI command and apply it after this short
+// network-quiet window.  Serial commands remain immediate.
+static constexpr uint32_t GUI_COMMAND_QUIET_MS = 80;
+
+
+// Independent stall / overload watchdog.
+// HALL mode uses Hall motion for stall/overload supervision. OPEN mode is
+// deliberately Hall-independent: no Hall init, no Hall telemetry, no Hall watchdog.
+static constexpr bool USE_HALL_WATCHDOG_IN_OPEN_LOOP = false;
+static constexpr float STALL_MIN_COMMAND_RPM = 35.0f;
+static constexpr uint32_t STALL_STARTUP_GRACE_MS = 1800;
+static constexpr uint32_t STALL_NO_HALL_TIMEOUT_MS = 800;
+static constexpr float OVERLOAD_MIN_SPEED_RATIO = 0.35f;
+static constexpr float OVERLOAD_CURRENT_RATIO = 0.75f;
+static constexpr uint32_t OVERLOAD_HOLD_MS = 1500;
+static constexpr uint32_t SAFETY_CHECK_PERIOD_MS = 20;
+
+// Commissioning compatibility with the known-good v0.3.7 behavior.
+// Keep the diagnostic code compiled in, but do not let experimental
+// WINDMILL / STALL / OVERLOAD / LOOP_GAP / software over-current trips
+// block OPEN_CURRENT_FOC while Hall is not connected.
+static constexpr bool ENABLE_EXPERIMENTAL_MOTION_SAFETY = false;
+
+// ============================================================================
+// 3. WI-FI
+// ============================================================================
+
+static const char* AP_SSID = "MaxxFan-Setup";
+static const char* AP_PASSWORD = "MaxxFan123";   // >= 8 characters
+
+static constexpr const char* FIRMWARE_VERSION = "0.3.6.3-DECOUPLED-GUI-NOHALL";
+
+// AP is always enabled, so 192.168.4.1 remains a recovery path.
+// Optional home Wi-Fi credentials are entered in the GUI and stored in NVS.
+
+// ============================================================================
+// 4. CONTROL CONFIGURATION
+// ============================================================================
+
+enum ControlMode : uint8_t {
+  OPEN_CURRENT_FOC = 0,
+  HALL_CURRENT_FOC = 1
+};
+
+static constexpr uint32_t CONFIG_VERSION = 6;
+
+struct Config {
+  uint32_t version;
+  uint8_t mode;
+
+  float maxRpm;
+  float minRpm;
+  float accelRpmPerSec;
+
+  float currentLimitA;
+  float motorVoltageLimitV;
+  float alignVoltageV;
+
+  float currentP;
+  float currentI;
+  float currentTf;
+
+  float velocityP;
+  float velocityI;
+  float velocityTf;
+
+  bool defaultReverse;
+
+  bool hallCalValid;
+  float hallZeroElectric;
+  int8_t hallDirection; // +1=CW, -1=CCW
+};
+
+Config makeDefaultConfig() {
+  Config c{};
+  c.version = CONFIG_VERSION;
+  c.mode = OPEN_CURRENT_FOC;
+
+  // Conservative first-test limits. OPEN is the safe/default commissioning mode.
+  // Hall is enabled only after explicitly selecting HALL_CURRENT_FOC. 
+  c.maxRpm = 600.0f;
+  c.minRpm = 120.0f;
+  c.accelRpmPerSec = 350.0f;
+
+  c.currentLimitA = 0.60f;
+  c.motorVoltageLimitV = 3.0f;
+  c.alignVoltageV = 0.60f;
+
+  // Current PI: inherited commissioning seeds, not validated tuning.
+  // These are intentionally below the aggressive MKS P=1/I=500 example.
+  c.currentP = 0.40f;
+  c.currentI = 180.0f;
+  c.currentTf = 0.002f;
+
+  // Hall velocity PI in current-output units.
+  c.velocityP = 0.008f;
+  c.velocityI = 0.080f;
+  c.velocityTf = 0.030f;
+
+  c.defaultReverse = false;
+
+  c.hallCalValid = false;
+  c.hallZeroElectric = 0.0f;
+  c.hallDirection = 1;
+  return c;
+}
+
+static Config cfg;
+static Config publishedConfig;
+
+// ============================================================================
+// 5. SIMPLEFOC OBJECTS
+// ============================================================================
+
+BLDCMotor motor = BLDCMotor(MOTOR_POLE_PAIRS);
+BLDCDriver3PWM driver = BLDCDriver3PWM(PIN_PWM_U, PIN_PWM_V, PIN_PWM_W, PIN_ENABLE);
+InlineCurrentSense currentSense = InlineCurrentSense(
+  CURRENT_SHUNT_OHM,
+  CURRENT_AMP_GAIN,
+  PIN_CURRENT_A,
+  PIN_CURRENT_B
+);
+
+HallSensor hall = HallSensor(PIN_HALL_A, PIN_HALL_B, PIN_HALL_C, MOTOR_POLE_PAIRS);
+
+volatile uint32_t hallTransitions = 0;
+portMUX_TYPE hallMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint8_t lastHallState = 0;
+volatile uint32_t lastHallEdgeUs = 0;
+
+bool validHallStep(uint8_t previous, uint8_t next) {
+  const uint8_t changed = previous ^ next;
+  return previous > 0 && previous < 7 && next > 0 && next < 7 &&
+         (changed == 1 || changed == 2 || changed == 4);
+}
+uint8_t readHallState() {
+  return (digitalRead(PIN_HALL_A) << 2) |
+         (digitalRead(PIN_HALL_B) << 1) | digitalRead(PIN_HALL_C);
+}
+void recordHallEdge() {
+  const uint8_t next = readHallState();
+  portENTER_CRITICAL_ISR(&hallMux);
+  if (validHallStep(lastHallState, next)) ++hallTransitions;
+  lastHallState = next;
+  lastHallEdgeUs = micros(); // any activity delays restart, including noise
+  portEXIT_CRITICAL_ISR(&hallMux);
+}
+void doHallA() { hall.handleA(); recordHallEdge(); }
+void doHallB() { hall.handleB(); recordHallEdge(); }
+void doHallC() { hall.handleC(); recordHallEdge(); }
+uint32_t hallQuietUs() {
+  portENTER_CRITICAL(&hallMux);
+  const uint32_t edge = lastHallEdgeUs;
+  portEXIT_CRITICAL(&hallMux);
+  return micros() - edge;
+}
+
+// ============================================================================
+// 6. NVS / WEB / THREAD-SAFE STATE
+// ============================================================================
+
+Preferences prefs;
+AsyncWebServer server(80);
+
+portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
+
+struct Telemetry {
+  bool motorReady;
+  bool enabled;
+  bool reversing;
+  uint8_t mode;
+  float requestedPercent;
+  int8_t requestedDirection;
+  float commandedRpm;
+  float measuredRpm;
+  bool measuredRpmValid;
+  float iqA;
+  float idA;
+  float uqV;
+  float udV;
+  float currentLimitA;
+  float voltageLimitV;
+  uint32_t hallTransitions;
+  float hallRpm;
+  bool hallWatchdogEnabled;
+  uint32_t hallQuietMs;
+  uint32_t loopGapUs;
+  bool sCurveActive;
+  bool faultLatched;
+  bool retryPending;
+  uint8_t retryAttempts;
+  uint32_t retryRemainingMs;
+  int32_t wifiRssi;
+  bool staConnected;
+  char staIp[20];
+  char apIp[20];
+  char staSsid[33];
+  char fault[96];
+};
+
+Telemetry telemetry{};
+
+// Explicit prototypes are intentional.
+// Arduino's .ino preprocessor can otherwise generate a prototype for a
+// custom return type before the struct declaration and fail with:
+//   'Telemetry' does not name a type
+Telemetry telemetrySnapshot();
+Config configSnapshot();
+
+struct PendingControl {
+  bool valid;
+  float percent;
+  int8_t direction;
+  uint32_t receivedAtMs;
+};
+PendingControl pendingControl{};
+
+struct PendingSettings {
+  bool valid;
+  Config value;
+};
+PendingSettings pendingSettings{};
+
+struct PendingWifi {
+  bool valid;
+  char ssid[33];
+  char password[65];
+};
+PendingWifi pendingWifi{};
+
+volatile bool pendingStop = false;
+volatile bool pendingClearFault = false
