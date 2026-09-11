@@ -1,0 +1,645 @@
+;
+    } else {
+      Serial.println("STA not connected; recovery AP remains available at 192.168.4.1");
+    }
+  }
+
+  // Friendly local hostname. 192.168.4.1 remains the guaranteed recovery URL.
+  if (MDNS.begin("maxxfan")) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("mDNS: http://maxxfan.local");
+  } else {
+    Serial.println("WARNING: mDNS start failed; use the IP address instead.");
+  }
+}
+
+// ============================================================================
+// 15. WEB GUI
+// ============================================================================
+
+static const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MaxxFan FOC</title>
+<style>
+:root{color-scheme:dark;--bg:#101318;--card:#1a2028;--line:#303946;--txt:#eef3f7;--muted:#99a8b8;--good:#65d49c;--warn:#ffbf69;--bad:#ff6b6b;--accent:#65a8ff}
+*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--txt);margin:0;padding:18px}.wrap{max-width:900px;margin:auto}h1{font-size:1.6rem;margin:0 0 4px}.sub{color:var(--muted);margin-bottom:18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}.label{font-size:.78rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}.value{font-size:1.25rem;margin-top:5px}.section{margin-top:14px}.section h2{font-size:1.05rem;margin:0 0 12px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.grow{flex:1;min-width:190px}button{border:1px solid var(--line);background:#252d38;color:var(--txt);border-radius:10px;padding:10px 14px;font-weight:650;cursor:pointer}button.primary{background:#245fa8}button.stop{background:#8d3030}button.active{outline:2px solid var(--accent)}input,select{width:100%;background:#10151b;border:1px solid var(--line);color:var(--txt);border-radius:9px;padding:9px}input[type=range]{padding:0}.formgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}.field label{display:block;color:var(--muted);font-size:.82rem;margin:0 0 5px}.note{font-size:.82rem;color:var(--muted);line-height:1.45}.msg{min-height:1.3em;color:var(--good);margin-top:8px}.fault{color:var(--bad);font-weight:700}.pill{display:inline-block;padding:3px 8px;border-radius:999px;font-size:.78rem;background:#252d38}.big{font-size:1.35rem;font-weight:700}.split{display:grid;grid-template-columns:1.3fr .7fr;gap:10px}@media(max-width:650px){.split{grid-template-columns:1fr}}
+</style>
+</head>
+<body><div class="wrap">
+<h1>MaxxFan BLDC Controller</h1>
+<div class="sub">MKS ESP32 FOC Mega · SimpleFOC 2.4 · physical current feedback</div>
+
+<div class="grid">
+ <div class="card"><div class="label">Mode</div><div id="modeCard" class="value">-</div></div>
+ <div class="card"><div class="label">Motor</div><div id="motorCard" class="value">-</div></div>
+ <div class="card"><div class="label">Commanded</div><div id="cmdRpm" class="value">0 rpm</div></div>
+ <div class="card"><div class="label">Measured</div><div id="measRpm" class="value">-</div></div>
+ <div class="card"><div class="label">Iq / Id</div><div id="curr" class="value">0 / 0 A</div></div>
+ <div class="card"><div class="label">Uq / Ud</div><div id="volt" class="value">0 / 0 V</div></div>
+ <div class="card"><div class="label">Wi-Fi</div><div id="wifi" class="value">AP</div></div>
+</div>
+
+<div class="card section">
+ <h2>Fan control</h2>
+ <div class="split">
+  <div>
+   <div class="row"><div class="big"><span id="speedText">0</span>%</div><div class="pill" id="rpmScale">max 600 rpm</div></div>
+   <input id="speed" type="range" min="0" max="100" step="1" value="0">
+  </div>
+  <div class="row">
+   <button id="fwd" class="active" onclick="setDir(1)">Forward</button>
+   <button id="rev" onclick="setDir(-1)">Reverse</button>
+   <button class="stop" onclick="stopNow()">STOP</button>
+  </div>
+ </div>
+ <div id="fault" class="fault"></div>
+ <div class="row" style="margin-top:8px"><button id="clearFaultBtn" style="display:none" onclick="clearFaultNow()">Clear fault</button></div>
+ <div id="ctrlMsg" class="msg"></div>
+</div>
+
+<div class="card section">
+ <h2>Safety watchdog</h2>
+ <div class="grid">
+  <div><div class="label">Hall watchdog</div><div id="hallWatch" class="value">-</div></div>
+  <div><div class="label">Hall RPM</div><div id="hallRpm" class="value">0 rpm</div></div>
+  <div><div class="label">Hall quiet</div><div id="hallQuiet" class="value">0 ms</div></div>
+  <div><div class="label">Loop gap (200 ms max)</div><div id="loopGap" class="value">0 us</div></div>
+  <div><div class="label">Fault latch</div><div id="faultLatch" class="value">CLEAR</div></div>
+ </div>
+ <div class="note" style="margin-top:10px">In OPEN mode Hall is completely unused. In HALL mode, a hard stall or persistent low-RPM/high-current overload disables the driver immediately and latches the fault.</div>
+</div>
+
+<div class="card section">
+ <h2>Motor settings</h2>
+ <div class="formgrid">
+  <div class="field"><label>Mode</label><select id="mode"><option value="0">Open-loop + real current FOC</option><option value="1">Hall closed-loop + current FOC</option></select></div>
+  <div class="field"><label>Max RPM</label><input id="maxRpm" type="number" step="10"></div>
+  <div class="field"><label>Minimum running RPM</label><input id="minRpm" type="number" step="10"></div>
+  <div class="field"><label>Full 0→100% S-curve time (s)</label><input id="rampTime" type="number" min="0.25" max="8" step="0.1"></div>
+  <div class="field"><label>Current limit A (hard max 2 A)</label><input id="currentLimit" type="number" step="0.05"></div>
+  <div class="field"><label>Motor voltage limit V (hard max 3 V)</label><input id="voltageLimit" type="number" step="0.1"></div>
+  <div class="field"><label>FOC alignment voltage V (current sense / Hall)</label><input id="alignVoltage" type="number" step="0.05"></div>
+  <div class="field"><label>Current PI - P</label><input id="currentP" type="number" step="0.01"></div>
+  <div class="field"><label>Current PI - I</label><input id="currentI" type="number" step="1"></div>
+  <div class="field"><label>Current LPF Tf s</label><input id="currentTf" type="number" step="0.0005"></div>
+  <div class="field"><label>Hall velocity PI - P</label><input id="velocityP" type="number" step="0.001"></div>
+  <div class="field"><label>Hall velocity PI - I</label><input id="velocityI" type="number" step="0.01"></div>
+  <div class="field"><label>Hall velocity LPF Tf s</label><input id="velocityTf" type="number" step="0.005"></div>
+ </div>
+ <div class="row" style="margin-top:12px">
+  <button class="primary" onclick="saveSettings()">Apply & save</button>
+  <button onclick="recalHall()">Recalibrate Hall</button>
+  <button onclick="resetDefaults()">Safe defaults</button>
+  <button onclick="restartEsp()">Restart</button>
+ </div>
+ <div class="note" style="margin-top:10px">Changing control mode restarts the ESP32. Hall recalibration also restarts and may move the motor briefly during FOC alignment. In OPEN mode the same alignment-voltage setting is used only for current-sense phase/sign alignment; Hall remains unused. The fan boots without a run command, but electrical alignment can move it briefly.</div>
+ <div id="settingsMsg" class="msg"></div>
+</div>
+
+<div class="card section">
+ <h2>Home Wi-Fi (optional)</h2>
+ <div class="formgrid">
+  <div class="field"><label>SSID</label><input id="ssid" list="wifiList" maxlength="32" autocomplete="off"><datalist id="wifiList"></datalist></div>
+  <div class="field"><label>Password</label><input id="pass" type="password" maxlength="64" autocomplete="new-password"></div>
+ </div>
+ <div class="row" style="margin-top:12px">
+  
+  <button class="primary" onclick="saveWifi()">Save Wi-Fi & restart</button>
+ </div>
+ <div id="scanMsg" class="msg"></div>
+ <div class="note" style="margin-top:10px">Enter the network SSID manually. Radio scans are disabled. Recovery AP is always available: <b>MaxxFan-Setup</b> / <b>MaxxFan123</b>, normally at <b>192.168.4.1</b>. You can also try <b>maxxfan.local</b>. The saved home password is never returned by the status API.</div>
+ <div id="wifiMsg" class="msg"></div>
+</div>
+
+<div class="card section note">
+ <b>Current mode note:</b> OPEN mode has real phase-current feedback but does not initialize or read the Hall sensor. HALL mode closes both rotor velocity/angle information and current control. All normal speed changes use a monotonic quintic S-curve. OPEN-mode current is softly faded at enable/disable to avoid the zero-speed click. The GUI intentionally makes no periodic network requests while the motor is active.<br><br>
+ <span id="extra"></span>
+</div>
+</div>
+<script>
+let dir=1, first=true, timer=null, refreshTimer=null, fullRampMs=1800;
+let controlBusy=false, controlDirty=false;
+const $=id=>document.getElementById(id);
+function enc(o){return Object.entries(o).map(([k,v])=>encodeURIComponent(k)+'='+encodeURIComponent(v)).join('&')}
+async function post(url,obj){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-MaxxFan-Control':'1'},body:enc(obj)});return await r.text()}
+function stopRefresh(){if(refreshTimer!==null){clearTimeout(refreshTimer);refreshTimer=null}}
+function scheduleRefresh(ms){stopRefresh();if(ms>0)refreshTimer=setTimeout(refresh,ms)}
+function setDirUI(){$('fwd').classList.toggle('active',dir===1);$('rev').classList.toggle('active',dir===-1)}
+function setDir(d){clearTimeout(timer);dir=d;setDirUI();queueControl()}
+function queueControl(){stopRefresh();controlDirty=true;flushControl()}
+async function flushControl(){
+ if(controlBusy)return;
+ controlBusy=true;
+ try{
+  while(controlDirty){
+   controlDirty=false;
+   const sp=Number($('speed').value), d=dir;
+   try{await post('/api/control',{speed:sp,dir:d})}catch(e){$('fault').textContent='GUI command connection lost'}
+  }
+ }finally{controlBusy=false}
+}
+$('speed').addEventListener('input',()=>{$('speedText').textContent=$('speed').value});
+$('speed').addEventListener('change',()=>{clearTimeout(timer);queueControl()});
+async function stopNow(){
+ clearTimeout(timer);stopRefresh();controlDirty=false;
+ $('speed').value=0;$('speedText').textContent=0;
+ try{await post('/api/stop',{});$('ctrlMsg').textContent='Smooth stop requested'}catch(e){$('fault').textContent='STOP connection lost'}
+ // No network traffic during the S-curve. Refresh only after the worst-case
+ // full ramp time plus margin, when the driver should already be disabled.
+ scheduleRefresh(fullRampMs+700);
+}
+async function clearFaultNow(){clearTimeout(timer);stopRefresh();$('speed').value=0;$('speedText').textContent=0;$('ctrlMsg').textContent=await post('/api/clear-fault',{});scheduleRefresh(800)}
+function f(n,d=3){return Number(n).toFixed(d)}
+function applyStatus(s){
+ $('modeCard').textContent=s.mode===1?'HALL CURRENT FOC':'OPEN CURRENT FOC';
+ $('motorCard').textContent=!s.ready?'FAULT':s.retry_pending?'RETRY IN '+Math.ceil(s.retry_remaining_ms/1000)+' s':s.fault_latched?'FAULT LATCHED':s.reversing?'REVERSING / SETTLING':s.enabled?(s.scurve?'RAMPING':'RUNNING'):'STOPPED';
+ $('cmdRpm').textContent=f(s.commanded_rpm,0)+' rpm';
+ $('measRpm').textContent=s.measured_valid?f(s.measured_rpm,0)+' rpm':'open-loop';
+ $('curr').textContent=f(s.iq,2)+' / '+f(s.id,2)+' A';
+ $('volt').textContent=f(s.uq,2)+' / '+f(s.ud,2)+' V';
+ $('wifi').textContent=s.sta_connected?(s.sta_ip+' · '+s.rssi+' dBm'):'AP '+s.ap_ip;
+ $('fault').textContent=(s.fault||'')+(s.retry_pending?' — automatic retry '+(s.retry_attempts+1)+'/3; STOP cancels':'');
+ $('clearFaultBtn').style.display=s.fault_latched?'inline-block':'none';
+ $('hallWatch').textContent=s.hall_watchdog?'ACTIVE':'OFF';
+ $('hallRpm').textContent=s.hall_watchdog?f(s.hall_rpm,0)+' rpm':'-';
+ $('hallQuiet').textContent=s.hall_watchdog?s.hall_quiet_ms+' ms':'-';
+ $('loopGap').textContent=s.loop_gap_us+' us';
+ $('faultLatch').textContent=s.fault_latched?'LATCHED':'CLEAR';
+ $('extra').textContent='Current limit '+f(s.current_limit,2)+' A · voltage limit '+f(s.voltage_limit,2)+' V · telemetry + Wi-Fi polling paused while motor runs';
+ if(first){dir=s.requested_dir<0?-1:1;setDirUI();$('speed').value=Math.round(s.requested_percent);$('speedText').textContent=Math.round(s.requested_percent);first=false}
+}
+async function refresh(){
+ try{
+  const s=await (await fetch('/api/status',{cache:'no-store'})).json();
+  applyStatus(s);
+  // Exactly like the known-clean 3.7 principle: do NOT generate periodic Wi-Fi
+  // traffic while PWM/control is active.
+  if(!s.enabled && !s.reversing && !s.scurve && Number(s.requested_percent)<=0.1 && !document.hidden) scheduleRefresh(2000);
+ }catch(e){$('fault').textContent='GUI connection lost';if(!document.hidden)scheduleRefresh(2000)}
+}
+async function loadConfig(){
+ try{const c=await (await fetch('/api/config',{cache:'no-store'})).json();
+  $('mode').value=c.mode;$('maxRpm').value=c.max_rpm;$('minRpm').value=c.min_rpm;
+  const rt=Number(c.max_rpm)/Math.max(Number(c.accel_rpm_s),1);fullRampMs=Math.max(250,Math.min(8000,rt*1000));$('rampTime').value=(fullRampMs/1000).toFixed(2);
+  $('currentLimit').value=c.current_limit;$('voltageLimit').value=c.voltage_limit;$('alignVoltage').value=c.align_voltage;
+  $('currentP').value=c.current_p;$('currentI').value=c.current_i;$('currentTf').value=c.current_tf;
+  $('velocityP').value=c.velocity_p;$('velocityI').value=c.velocity_i;$('velocityTf').value=c.velocity_tf;
+  $('rpmScale').textContent='max '+f(c.max_rpm,0)+' rpm';
+ }catch(e){$('fault').textContent='Config connection lost'}
+}
+async function saveSettings(){
+ const maxRpm=Math.max(Number($('maxRpm').value),1), rampTime=Math.max(Number($('rampTime').value),0.25);
+ const accel=maxRpm/rampTime;
+ const obj={mode:$('mode').value,maxRpm:$('maxRpm').value,minRpm:$('minRpm').value,accel,currentLimit:$('currentLimit').value,voltageLimit:$('voltageLimit').value,alignVoltage:$('alignVoltage').value,currentP:$('currentP').value,currentI:$('currentI').value,currentTf:$('currentTf').value,velocityP:$('velocityP').value,velocityI:$('velocityI').value,velocityTf:$('velocityTf').value};
+ $('settingsMsg').textContent=await post('/api/settings',obj);setTimeout(()=>location.reload(),900)
+}
+async function recalHall(){if(confirm('Clear saved Hall calibration and restart? The motor may move during calibration.')){$('settingsMsg').textContent=await post('/api/recal',{});setTimeout(()=>location.reload(),1500)}}
+async function resetDefaults(){if(confirm('Restore safe motor defaults? Wi-Fi credentials are kept.')){$('settingsMsg').textContent=await post('/api/defaults',{});setTimeout(()=>location.reload(),1200)}}
+async function restartEsp(){$('settingsMsg').textContent=await post('/api/restart',{});setTimeout(()=>location.reload(),1200)}
+async function saveWifi(){$('wifiMsg').textContent=await post('/api/wifi',{ssid:$('ssid').value,pass:$('pass').value});setTimeout(()=>location.reload(),1800)}
+document.addEventListener('visibilitychange',()=>{if(document.hidden)stopRefresh();else refresh()});
+loadConfig();refresh();
+</script></body></html>
+)rawliteral";
+
+bool requirePostParam(AsyncWebServerRequest* request, const char* name) {
+  return request->hasParam(name, true);
+}
+
+bool parseFiniteNumber(const char* text, float& value) {
+  if (!text || !*text) return false;
+  char* end = nullptr;
+  errno = 0;
+  value = strtof(text, &end);
+  return end != text && *end == '\0' && errno != ERANGE && isfinite(value);
+}
+bool validateNumericPost(AsyncWebServerRequest* request) {
+  const char* names[] = {"speed", "dir", "mode", "maxRpm", "minRpm", "accel",
+    "currentLimit", "voltageLimit", "alignVoltage", "currentP", "currentI",
+    "currentTf", "velocityP", "velocityI", "velocityTf"};
+  for (const char* name : names) {
+    if (!request->hasParam(name, true)) continue;
+    float value;
+    if (!parseFiniteNumber(request->getParam(name, true)->value().c_str(), value) ||
+        (!strcmp(name, "dir") && value != -1 && value != 1) ||
+        (!strcmp(name, "mode") && value != 0 && value != 1)) {
+      request->send(400, "text/plain", "Invalid numeric parameter");
+      return false;
+    }
+  }
+  return true;
+}
+float postFloat(AsyncWebServerRequest* request, const char* name, float fallback) {
+  if (!request->hasParam(name, true)) return fallback;
+  float value;
+  return parseFiniteNumber(request->getParam(name, true)->value().c_str(), value)
+    ? value : fallback;
+}
+
+int postInt(AsyncWebServerRequest* request, const char* name, int fallback) {
+  if (!request->hasParam(name, true)) return fallback;
+  return request->getParam(name, true)->value().toInt();
+}
+
+bool authorizeRequest(AsyncWebServerRequest* request) {
+  if (!request->authenticate("admin", AP_PASSWORD)) {
+    request->requestAuthentication();
+    return false;
+  }
+  // Cross-origin forms cannot provide this header; no CORS permission is sent.
+  if (request->method() == HTTP_POST &&
+      (!request->hasHeader("X-MaxxFan-Control") ||
+       request->getHeader("X-MaxxFan-Control")->value() != "1")) {
+    request->send(403, "text/plain", "Missing control header");
+    return false;
+  }
+  return true;
+}
+void setupWebServer() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    request->send_P(200, "text/html", INDEX_HTML);
+  });
+
+  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    const Telemetry t = telemetrySnapshot();
+
+    String j;
+    j.reserve(900);
+    j += "{";
+    j += "\"ready\":" + String(t.motorReady ? "true" : "false");
+    j += ",\"enabled\":" + String(t.enabled ? "true" : "false");
+    j += ",\"reversing\":" + String(t.reversing ? "true" : "false");
+    j += ",\"scurve\":" + String(t.sCurveActive ? "true" : "false");
+    j += ",\"mode\":" + String((int)t.mode);
+    j += ",\"requested_percent\":" + String(t.requestedPercent, 1);
+    j += ",\"requested_dir\":" + String((int)t.requestedDirection);
+    j += ",\"commanded_rpm\":" + String(t.commandedRpm, 1);
+    j += ",\"measured_valid\":" + String(t.measuredRpmValid ? "true" : "false");
+    j += ",\"measured_rpm\":" + String(t.measuredRpm, 1);
+    j += ",\"iq\":" + String(t.iqA, 3);
+    j += ",\"id\":" + String(t.idA, 3);
+    j += ",\"uq\":" + String(t.uqV, 3);
+    j += ",\"ud\":" + String(t.udV, 3);
+    j += ",\"current_limit\":" + String(t.currentLimitA, 3);
+    j += ",\"voltage_limit\":" + String(t.voltageLimitV, 3);
+    j += ",\"hall_transitions\":" + String(t.hallTransitions);
+    j += ",\"hall_rpm\":" + String(t.hallRpm, 1);
+    j += ",\"hall_watchdog\":" + String(t.hallWatchdogEnabled ? "true" : "false");
+    j += ",\"hall_quiet_ms\":" + String(t.hallQuietMs);
+    j += ",\"loop_gap_us\":" + String(t.loopGapUs);
+    j += ",\"fault_latched\":" + String(t.faultLatched ? "true" : "false");
+    j += ",\"retry_pending\":" + String(t.retryPending ? "true" : "false");
+    j += ",\"retry_attempts\":" + String(t.retryAttempts);
+    j += ",\"retry_remaining_ms\":" + String(t.retryRemainingMs);
+    j += ",\"sta_connected\":" + String(t.staConnected ? "true" : "false");
+    j += ",\"rssi\":" + String(t.wifiRssi);
+    j += ",\"sta_ip\":\"" + jsonEscape(t.staIp) + "\"";
+    j += ",\"ap_ip\":\"" + jsonEscape(t.apIp) + "\"";
+    j += ",\"ssid\":\"" + jsonEscape(t.staSsid) + "\"";
+    j += ",\"fault\":\"" + jsonEscape(t.fault) + "\"";
+    j += "}";
+
+    AsyncWebServerResponse* response = request->beginResponse(200, "application/json", j);
+    response->addHeader("Cache-Control", "no-store, max-age=0");
+    response->addHeader("Pragma", "no-cache");
+    request->send(response);
+  });
+
+  server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    const Config c = configSnapshot();
+    String j;
+    j.reserve(520);
+    j += "{";
+    j += "\"mode\":" + String((int)c.mode);
+    j += ",\"max_rpm\":" + String(c.maxRpm, 1);
+    j += ",\"min_rpm\":" + String(c.minRpm, 1);
+    j += ",\"accel_rpm_s\":" + String(c.accelRpmPerSec, 1);
+    j += ",\"current_limit\":" + String(c.currentLimitA, 3);
+    j += ",\"voltage_limit\":" + String(c.motorVoltageLimitV, 3);
+    j += ",\"align_voltage\":" + String(c.alignVoltageV, 3);
+    j += ",\"current_p\":" + String(c.currentP, 4);
+    j += ",\"current_i\":" + String(c.currentI, 3);
+    j += ",\"current_tf\":" + String(c.currentTf, 5);
+    j += ",\"velocity_p\":" + String(c.velocityP, 5);
+    j += ",\"velocity_i\":" + String(c.velocityI, 4);
+    j += ",\"velocity_tf\":" + String(c.velocityTf, 5);
+    j += ",\"hall_cal_valid\":" + String(c.hallCalValid ? "true" : "false");
+    j += "}";
+    AsyncWebServerResponse* response = request->beginResponse(200, "application/json", j);
+    response->addHeader("Cache-Control", "no-store, max-age=0");
+    response->addHeader("Pragma", "no-cache");
+    request->send(response);
+  });
+
+  server.on("/api/control", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    if (!validateNumericPost(request)) return;
+    if (request->hasParam("speed", true) && postFloat(request, "speed", -1) == 0) {
+      portENTER_CRITICAL(&stateMux);
+      pendingStop = true;
+      portEXIT_CRITICAL(&stateMux);
+      request->send(200, "text/plain", "Smooth stop requested; automatic retry cancelled.");
+      return;
+    }
+    if (telemetrySnapshot().faultLatched) {
+      request->send(409, "text/plain", "Recovery pending or fault latched. STOP cancels; clear leaves stopped.");
+      return;
+    }
+    if (!requirePostParam(request, "speed") || !requirePostParam(request, "dir")) {
+      request->send(400, "text/plain", "Missing speed/dir");
+      return;
+    }
+    PendingControl pc{};
+    pc.valid = true;
+    pc.percent = clampf(postFloat(request, "speed", 0.0f), 0.0f, 100.0f);
+    pc.direction = postInt(request, "dir", 1) < 0 ? -1 : 1;
+    pc.receivedAtMs = millis();
+
+    portENTER_CRITICAL(&stateMux);
+    pendingControl = pc;
+    portEXIT_CRITICAL(&stateMux);
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/api/stop", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    portENTER_CRITICAL(&stateMux);
+    pendingStop = true;
+    portEXIT_CRITICAL(&stateMux);
+    request->send(200, "text/plain", "Smooth stop requested");
+  });
+
+  server.on("/api/clear-fault", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    portENTER_CRITICAL(&stateMux);
+    pendingClearFault = true;
+    portEXIT_CRITICAL(&stateMux);
+    request->send(200, "text/plain", "Fault clear requested. Motor remains stopped.");
+  });
+
+  server.on("/api/settings", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    if (!validateNumericPost(request)) return;
+    Config c = configSnapshot();
+    c.mode = (uint8_t)postInt(request, "mode", c.mode);
+    c.maxRpm = postFloat(request, "maxRpm", c.maxRpm);
+    c.minRpm = postFloat(request, "minRpm", c.minRpm);
+    c.accelRpmPerSec = postFloat(request, "accel", c.accelRpmPerSec);
+    c.currentLimitA = postFloat(request, "currentLimit", c.currentLimitA);
+    c.motorVoltageLimitV = postFloat(request, "voltageLimit", c.motorVoltageLimitV);
+    c.alignVoltageV = postFloat(request, "alignVoltage", c.alignVoltageV);
+    c.currentP = postFloat(request, "currentP", c.currentP);
+    c.currentI = postFloat(request, "currentI", c.currentI);
+    c.currentTf = postFloat(request, "currentTf", c.currentTf);
+    c.velocityP = postFloat(request, "velocityP", c.velocityP);
+    c.velocityI = postFloat(request, "velocityI", c.velocityI);
+    c.velocityTf = postFloat(request, "velocityTf", c.velocityTf);
+    validateConfig(c);
+
+    PendingSettings ps{};
+    ps.valid = true;
+    ps.value = c;
+
+    portENTER_CRITICAL(&stateMux);
+    pendingSettings = ps;
+    portEXIT_CRITICAL(&stateMux);
+
+    request->send(200, "text/plain", "Settings accepted. Mode changes reboot automatically.");
+  });
+
+  server.on("/api/wifi", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    if (!request->hasParam("ssid", true)) {
+      request->send(400, "text/plain", "Missing SSID");
+      return;
+    }
+    String ssid = request->getParam("ssid", true)->value();
+    String pass = request->hasParam("pass", true) ? request->getParam("pass", true)->value() : "";
+    ssid.trim();
+    if (ssid.length() > 32 || pass.length() > 64) {
+      request->send(400, "text/plain", "SSID/password too long");
+      return;
+    }
+
+    PendingWifi p{};
+    p.valid = true;
+    strncpy(p.ssid, ssid.c_str(), sizeof(p.ssid) - 1);
+    strncpy(p.password, pass.c_str(), sizeof(p.password) - 1);
+
+    portENTER_CRITICAL(&stateMux);
+    pendingWifi = p;
+    portEXIT_CRITICAL(&stateMux);
+
+    request->send(200, "text/plain", "Wi-Fi saved. Restarting...");
+  });
+
+  server.on("/api/recal", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    portENTER_CRITICAL(&stateMux);
+    pendingRecalibrate = true;
+    portEXIT_CRITICAL(&stateMux);
+    request->send(200, "text/plain", "Hall calibration cleared. Restarting...");
+  });
+
+  server.on("/api/defaults", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    portENTER_CRITICAL(&stateMux);
+    pendingDefaults = true;
+    portEXIT_CRITICAL(&stateMux);
+    request->send(200, "text/plain", "Safe defaults restored. Restarting...");
+  });
+
+  server.on("/api/restart", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    portENTER_CRITICAL(&stateMux);
+    pendingRestart = true;
+    portEXIT_CRITICAL(&stateMux);
+    request->send(200, "text/plain", "Restarting...");
+  });
+
+  server.onNotFound([](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    request->send(404, "text/plain", "Not found");
+  });
+
+  server.begin();
+  Serial.println("Web server started.");
+}
+
+// ============================================================================
+// 16. SERIAL - intentionally quiet unless requested
+// ============================================================================
+
+void printSerialStatus() {
+  if (Serial.availableForWrite() < 400) return;
+  Telemetry t = telemetrySnapshot();
+  Serial.printf("retry_pending=%d attempts=%u/3 cooldown=%lums ",
+    t.retryPending, t.retryAttempts, (unsigned long)t.retryRemainingMs);
+  Serial.printf(
+    "mode=%s ready=%d enabled=%d req=%.0f%% dir=%d cmd=%.0frpm ",
+    t.mode == HALL_CURRENT_FOC ? "HALL" : "OPEN",
+    t.motorReady,
+    t.enabled,
+    t.requestedPercent,
+    t.requestedDirection,
+    t.commandedRpm
+  );
+  if (t.measuredRpmValid) Serial.printf("meas=%.0frpm ", t.measuredRpm);
+  Serial.printf("Hall=%.0frpm quiet=%lums watchdog=%d Iq=%.3fA Id=%.3fA Uq=%.2fV Ud=%.2fV loopMax=%luus SC=%d latched=%d fault=%s\n",
+                t.hallRpm, (unsigned long)t.hallQuietMs, t.hallWatchdogEnabled,
+                t.iqA, t.idA, t.uqV, t.udV, (unsigned long)t.loopGapUs,
+                t.sCurveActive, t.faultLatched, t.fault);
+}
+
+void handleSerial() {
+  static char buf[48];
+  static size_t n = 0;
+  static bool overflow = false;
+  unsigned budget = 32;
+  while (budget-- && Serial.available()) {
+    char ch = (char)Serial.read();
+    if (ch == '\r') continue;
+    if (ch == '\n') {
+      if (overflow) { n = 0; overflow = false; continue; }
+      buf[n] = 0;
+      n = 0;
+      String s(buf);
+      s.trim();
+      s.toLowerCase();
+      if (s == "?" || s == "status") {
+        printSerialStatus();
+      } else if (s == "stop" || s == "x") {
+        retryPolicy.cancel();
+        requestedPercent = 0.0f;
+        Serial.println("Smooth stop requested");
+      } else if (s == "clear") {
+        clearSafetyFault();
+      } else if (s == "mode open") {
+        retryPolicy.cancel();
+        requestedPercent = 0.0f;
+        disableMotorNow();
+        cfg.mode = OPEN_CURRENT_FOC;
+        saveConfig();
+        Serial.println("Mode saved: OPEN_CURRENT_FOC. Restarting...");
+        scheduleRestart(500);
+      } else if (s == "mode hall") {
+        retryPolicy.cancel();
+        requestedPercent = 0.0f;
+        disableMotorNow();
+        cfg.mode = HALL_CURRENT_FOC;
+        saveConfig();
+        Serial.println("Mode saved: HALL_CURRENT_FOC. Restarting...");
+        scheduleRestart(500);
+      } else if (s == "f") {
+        retryPolicy.cancel();
+        requestedDirection = 1;
+        Serial.println("Direction: forward");
+      } else if (s == "r") {
+        retryPolicy.cancel();
+        requestedDirection = -1;
+        Serial.println("Direction: reverse");
+      } else if (s.startsWith("s ")) {
+        float stopValue;
+        if (parseFiniteNumber(s.substring(2).c_str(), stopValue) && stopValue == 0) {
+          retryPolicy.cancel();
+          requestedPercent = 0;
+          continue;
+        }
+        if (safetyFaultLatched) {
+          Serial.println("Safety fault is latched. Use: clear");
+        } else {
+          float value;
+          if (!parseFiniteNumber(s.substring(2).c_str(), value)) continue;
+          requestedPercent = clampf(value, 0.0f, 100.0f);
+          Serial.printf("Speed request: %.0f%%\n", requestedPercent);
+        }
+      } else if (s.length()) {
+        Serial.println("Commands: status | mode open | mode hall | s 0..100 | f | r | stop | clear");
+      }
+    } else if (n < sizeof(buf) - 1) {
+      buf[n++] = ch;
+    } else {
+      overflow = true;
+    }
+  }
+}
+
+// ============================================================================
+// 17. ARDUINO SETUP / LOOP
+// ============================================================================
+
+void setup() {
+  pinMode(PIN_ENABLE, OUTPUT);
+  digitalWrite(PIN_ENABLE, LOW);
+  Serial.setTxBufferSize(1024);
+  Serial.begin(115200);
+  delay(150);
+  Serial.println();
+  Serial.print("=== MaxxFan MKS ESP32 FOC Mega v");
+  Serial.print(FIRMWARE_VERSION);
+  Serial.println(" ===");
+  Serial.println("Required library: SimpleFOC 2.4.0");
+
+  if (!prefs.begin("maxxfan", false)) {
+    Serial.println("FATAL: NVS unavailable; driver disabled");
+    while (true) delay(1000);
+  }
+  loadConfig();
+
+  Serial.print("Control mode: ");
+  Serial.println(cfg.mode == HALL_CURRENT_FOC ? "HALL_CURRENT_FOC" : "OPEN_CURRENT_FOC");
+
+  // Clear an old experimental safety latch so a previous WINDMILL test cannot
+  // prevent this commissioning build from initializing.
+  if (!ENABLE_EXPERIMENTAL_MOTION_SAFETY) prefs.putBool("safetytrip", false);
+  const bool persistedFault = ENABLE_EXPERIMENTAL_MOTION_SAFETY &&
+                             prefs.getBool("safetytrip", false);
+
+  // Start connectivity before any driver/current-sense/FOC initialization.
+  // If motor setup fails or takes time, MaxxFan-Setup remains reachable for
+  // diagnosis instead of leaving the browser with a connection timeout.
+  publishedConfig = cfg;
+  setupWiFi();
+  setupWebServer();
+  updateTelemetry();
+
+  motorReady = setupMotor();
+  if (!motorReady) disableMotorNow();
+  if (persistedFault) {
+    safetyFaultLatched = true;
+    setFault("PREVIOUS_FAULT: inspect hardware, then clear manually");
+  }
+  publishedConfig = cfg;
+  updateTelemetry();
+
+  Serial.println("GUI recovery AP: MaxxFan-Setup / MaxxFan123");
+  Serial.println("GUI URL: http://192.168.4.1  or  http://maxxfan.local");
+  Serial.println("Open: http://192.168.4.1");
+  Serial.println("OPEN mode: Hall completely OFF; physical current feedback only.");
+  Serial.println("Experimental motion safety: DISABLED for commissioning.");
+  Serial.println("Serial commands: status | mode open | mode hall | s 0..100 | f | r | stop | clear");
+}
+
+void loop() {
+  // Motor loop first and as frequently as possible.
+  runMotorControl();
+
+  processPendingCommands();
+  updateTelemetry();
+  handleSerial();
+  serviceAutoRecovery();
+
+  if (scheduledRestartAtMs && (int32_t)(millis() - scheduledRestartAtMs) >= 0) {
+    requestedPercent = 0.0f;
+    disableMotorNow();
+    delay(20);
+    ESP.restart();
+  }
+}
