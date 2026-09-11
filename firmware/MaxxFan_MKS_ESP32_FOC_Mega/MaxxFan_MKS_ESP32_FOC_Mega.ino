@@ -223,7 +223,7 @@ static constexpr bool ENABLE_EXPERIMENTAL_MOTION_SAFETY = false;
 static const char* AP_SSID = "MaxxFan-Setup";
 static const char* AP_PASSWORD = "MaxxFan123";   // >= 8 characters
 
-static constexpr const char* FIRMWARE_VERSION = "0.3.6.3-DECOUPLED-GUI-NOHALL";
+static constexpr const char* FIRMWARE_VERSION = "0.4.0-DYNAMIC-CURRENT-EXPERIMENTAL";
 
 // AP is always enabled, so 192.168.4.1 remains a recovery path.
 // Optional home Wi-Fi credentials are entered in the GUI and stored in NVS.
@@ -303,6 +303,29 @@ Config makeDefaultConfig() {
 static Config cfg;
 static Config publishedConfig;
 
+// OPEN_CURRENT_FOC dynamic q-current profile. Stored under independent NVS keys
+// so the proven CONFIG_VERSION=6 blob remains backward-compatible.
+struct DynamicCurrentConfig {
+  bool enabled;
+  float minRunCurrentA;
+  float exponent;
+  float startupBoostA;
+  uint32_t startupBoostMs;
+};
+
+DynamicCurrentConfig makeDefaultDynamicCurrentConfig() {
+  DynamicCurrentConfig d{};
+  d.enabled = true;
+  d.minRunCurrentA = 0.22f;
+  d.exponent = 2.0f;
+  d.startupBoostA = 0.60f;
+  d.startupBoostMs = 650;
+  return d;
+}
+
+static DynamicCurrentConfig dynCfg;
+static DynamicCurrentConfig publishedDynCfg;
+
 // ============================================================================
 // 5. SIMPLEFOC OBJECTS
 // ============================================================================
@@ -373,6 +396,8 @@ struct Telemetry {
   float idA;
   float uqV;
   float udV;
+  float iqRequestA;
+  bool dynamicCurrentEnabled;
   float currentLimitA;
   float voltageLimitV;
   uint32_t hallTransitions;
@@ -401,6 +426,7 @@ Telemetry telemetry{};
 //   'Telemetry' does not name a type
 Telemetry telemetrySnapshot();
 Config configSnapshot();
+DynamicCurrentConfig dynamicConfigSnapshot();
 
 struct PendingControl {
   bool valid;
@@ -413,6 +439,7 @@ PendingControl pendingControl{};
 struct PendingSettings {
   bool valid;
   Config value;
+  DynamicCurrentConfig dynamic;
 };
 PendingSettings pendingSettings{};
 
@@ -458,6 +485,7 @@ struct SCurveState {
 SCurveState speedCurve;
 
 float openCurrentScale = 0.0f;
+float openIqRequestA = 0.0f;
 bool openCurrentFadeIn = false;
 bool openCurrentFadeOut = false;
 uint32_t openCurrentFadeStartedUs = 0;
@@ -551,6 +579,15 @@ void validateConfig(Config& c) {
   }
 }
 
+
+void validateDynamicCurrentConfig(DynamicCurrentConfig& d) {
+  d.minRunCurrentA = clampf(d.minRunCurrentA, 0.05f, HARD_MAX_CURRENT_A);
+  d.exponent = clampf(d.exponent, 0.5f, 4.0f);
+  d.startupBoostA = clampf(d.startupBoostA, 0.05f, HARD_MAX_CURRENT_A);
+  if (d.startupBoostMs < 100) d.startupBoostMs = 100;
+  if (d.startupBoostMs > 5000) d.startupBoostMs = 5000;
+}
+
 String jsonEscape(const char* s) {
   String out;
   if (!s) return out;
@@ -573,6 +610,48 @@ String jsonEscape(const char* s) {
 static inline float smootherstep01(float x) {
   x = clampf(x, 0.0f, 1.0f);
   return x*x*x * (x * (x * 6.0f - 15.0f) + 10.0f);
+}
+
+// Dynamic OPEN current command. currentLimitA remains the hard ceiling.
+// The low-speed floor ramps from zero to minRunCurrentA by minRpm; above that
+// the extra current follows a fan-like power law up to the hard ceiling.
+float dynamicOpenCurrentForRpm(float absRpm) {
+  const float hard = cfg.currentLimitA;
+  if (!dynCfg.enabled) return hard;
+  if (absRpm <= 0.01f) return 0.0f;
+
+  const float minIq = min(dynCfg.minRunCurrentA, hard);
+  const float x = clampf(absRpm / max(cfg.maxRpm, 1.0f), 0.0f, 1.0f);
+  const float lowX = clampf(absRpm / max(cfg.minRpm, 1.0f), 0.0f, 1.0f);
+  const float lowFloor = minIq * smootherstep01(lowX);
+  const float curve = (hard - minIq) * powf(x, dynCfg.exponent);
+  return clampf(lowFloor + curve, 0.0f, hard);
+}
+
+float dynamicOpenCurrentRequest(uint32_t nowMs) {
+  if (cfg.mode != OPEN_CURRENT_FOC) return cfg.currentLimitA;
+  const float absRpm = fabsf(radToRpm(rampedRadPerSec));
+  float request = dynamicOpenCurrentForRpm(absRpm);
+
+  // OPEN reversal deliberately keeps the bridge enabled. Do not let the
+  // dynamic profile collapse to 0 A at the zero-speed crossing, otherwise the
+  // rotor is briefly released exactly where we want a continuous magnetic
+  // handover. A real STOP uses the separate fade-out path and still reaches 0.
+  if (dynCfg.enabled && reversalPending && requestedPercent > 0.01f) {
+    request = max(request, min(dynCfg.minRunCurrentA, cfg.currentLimitA));
+  }
+
+  if (!dynCfg.enabled || !motorEnabled || dynCfg.startupBoostMs == 0) return request;
+
+  const uint32_t elapsed = nowMs - motorEnabledAtMs;
+  if (elapsed >= dynCfg.startupBoostMs) return request;
+
+  // Avoid a static full-current kick at zero electrical speed. Admit boost only
+  // once the open-loop rotating field is moving, then fade it out smoothly.
+  const float speedGate = smootherstep01(clampf(absRpm / max(30.0f, cfg.minRpm * 0.35f), 0.0f, 1.0f));
+  const float timeFade = 1.0f - smootherstep01((float)elapsed / (float)dynCfg.startupBoostMs);
+  const float boost = min(dynCfg.startupBoostA, cfg.currentLimitA);
+  return clampf(request + max(0.0f, boost - request) * speedGate * timeFade, 0.0f, cfg.currentLimitA);
 }
 
 uint32_t sCurveDurationUs(float fromRad, float toRad) {
@@ -704,6 +783,7 @@ bool updateOpenCurrentEnvelope(uint32_t nowUs) {
   if (cfg.mode != OPEN_CURRENT_FOC) {
     openCurrentScale = 1.0f;
     openCurrentFadeIn = openCurrentFadeOut = false;
+    openIqRequestA = cfg.currentLimitA;
     motor.current_limit = cfg.currentLimitA;
     return true;
   }
@@ -729,7 +809,9 @@ bool updateOpenCurrentEnvelope(uint32_t nowUs) {
     }
   }
 
-  motor.current_limit = cfg.currentLimitA * clampf(openCurrentScale, 0.0f, 1.0f);
+  const float profileIq = dynamicOpenCurrentRequest(millis());
+  openIqRequestA = profileIq * clampf(openCurrentScale, 0.0f, 1.0f);
+  motor.current_limit = clampf(openIqRequestA, 0.0f, cfg.currentLimitA);
   return !openCurrentFadeOut && openCurrentScale <= 0.0005f;
 }
 
@@ -745,6 +827,7 @@ void disableMotorNow() {
   motorEnabled = false;
   overloadStartedMs = 0;
   openCurrentScale = 0.0f;
+  openIqRequestA = 0.0f;
   openCurrentFadeIn = false;
   openCurrentFadeOut = false;
   // Keep the configured limit as the resting configuration. enableMotorNow()
@@ -776,6 +859,7 @@ void enableMotorNow() {
   motor.target = 0.0f;
   if (cfg.mode == OPEN_CURRENT_FOC) {
     openCurrentScale = 0.0f;
+    openIqRequestA = 0.0f;
     motor.current_limit = 0.0f;
     startOpenCurrentFadeIn(micros(), 0.0f);
   } else {
@@ -904,6 +988,28 @@ void saveConfig() {
     safetyFaultLatched = true;
     setFault("NVS: config save failed; restart inhibited until checked");
   }
+}
+
+
+void saveDynamicCurrentConfig() {
+  validateDynamicCurrentConfig(dynCfg);
+  bool ok = true;
+  ok &= prefs.putBool("dynen", dynCfg.enabled) > 0;
+  ok &= prefs.putFloat("dynmin", dynCfg.minRunCurrentA) > 0;
+  ok &= prefs.putFloat("dynexp", dynCfg.exponent) > 0;
+  ok &= prefs.putFloat("dynboost", dynCfg.startupBoostA) > 0;
+  ok &= prefs.putUInt("dynbms", dynCfg.startupBoostMs) > 0;
+  if (!ok) setFault("NVS: dynamic-current save failed");
+}
+
+void loadDynamicCurrentConfig() {
+  const DynamicCurrentConfig d = makeDefaultDynamicCurrentConfig();
+  dynCfg.enabled = prefs.getBool("dynen", d.enabled);
+  dynCfg.minRunCurrentA = prefs.getFloat("dynmin", d.minRunCurrentA);
+  dynCfg.exponent = prefs.getFloat("dynexp", d.exponent);
+  dynCfg.startupBoostA = prefs.getFloat("dynboost", d.startupBoostA);
+  dynCfg.startupBoostMs = prefs.getUInt("dynbms", d.startupBoostMs);
+  validateDynamicCurrentConfig(dynCfg);
 }
 
 void loadConfig() {
@@ -1492,15 +1598,19 @@ void processPendingCommands() {
 
   if (ps.valid) {
     Config next = ps.value;
+    DynamicCurrentConfig nextDyn = ps.dynamic;
     validateConfig(next);
+    validateDynamicCurrentConfig(nextDyn);
     const bool modeChanged = next.mode != cfg.mode;
     next.hallCalValid = cfg.hallCalValid;
     next.hallZeroElectric = cfg.hallZeroElectric;
     next.hallDirection = cfg.hallDirection;
     portENTER_CRITICAL(&stateMux);
     cfg = next;
+    dynCfg = nextDyn;
     portEXIT_CRITICAL(&stateMux);
     saveConfig();
+    saveDynamicCurrentConfig();
     if (modeChanged) scheduleRestart(600);
     else if (motorReady) applyRuntimeConfig();
   }
@@ -1521,10 +1631,13 @@ void processPendingCommands() {
 
   if (doDefaults) {
     Config d = makeDefaultConfig();
+    DynamicCurrentConfig dd = makeDefaultDynamicCurrentConfig();
     portENTER_CRITICAL(&stateMux);
     cfg = d;
+    dynCfg = dd;
     portEXIT_CRITICAL(&stateMux);
     saveConfig();
+    saveDynamicCurrentConfig();
     scheduleRestart(600);
   }
 
@@ -1581,6 +1694,8 @@ void updateTelemetry() {
   t.requestedPercent = requestedPercent;
   t.requestedDirection = requestedDirection;
   t.commandedRpm = radToRpm(rampedRadPerSec);
+  t.iqRequestA = (cfg.mode == OPEN_CURRENT_FOC) ? openIqRequestA : motor.current_sp;
+  t.dynamicCurrentEnabled = (cfg.mode == OPEN_CURRENT_FOC) && dynCfg.enabled;
   t.currentLimitA = cfg.currentLimitA;
   t.voltageLimitV = cfg.motorVoltageLimitV;
   t.loopGapUs = loopGapWindowMaxUs;
@@ -1630,6 +1745,7 @@ void updateTelemetry() {
   portENTER_CRITICAL(&stateMux);
   telemetry = t;
   publishedConfig = cfg;
+  publishedDynCfg = dynCfg;
   portEXIT_CRITICAL(&stateMux);
 }
 
@@ -1647,6 +1763,14 @@ Config configSnapshot() {
   c = publishedConfig;
   portEXIT_CRITICAL(&stateMux);
   return c;
+}
+
+DynamicCurrentConfig dynamicConfigSnapshot() {
+  DynamicCurrentConfig d{};
+  portENTER_CRITICAL(&stateMux);
+  d = publishedDynCfg;
+  portEXIT_CRITICAL(&stateMux);
+  return d;
 }
 
 // ============================================================================
@@ -1721,7 +1845,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
  <div class="card"><div class="label">Motor</div><div id="motorCard" class="value">-</div></div>
  <div class="card"><div class="label">Commanded</div><div id="cmdRpm" class="value">0 rpm</div></div>
  <div class="card"><div class="label">Measured</div><div id="measRpm" class="value">-</div></div>
- <div class="card"><div class="label">Iq / Id</div><div id="curr" class="value">0 / 0 A</div></div>
+ <div class="card"><div class="label">Iq request / measured</div><div id="curr" class="value">0 / 0 A</div></div>
  <div class="card"><div class="label">Uq / Ud</div><div id="volt" class="value">0 / 0 V</div></div>
  <div class="card"><div class="label">Wi-Fi</div><div id="wifi" class="value">AP</div></div>
 </div>
@@ -1764,6 +1888,11 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div class="field"><label>Minimum running RPM</label><input id="minRpm" type="number" step="10"></div>
   <div class="field"><label>Full 0→100% S-curve time (s)</label><input id="rampTime" type="number" min="0.25" max="8" step="0.1"></div>
   <div class="field"><label>Current limit A (hard max 2 A)</label><input id="currentLimit" type="number" step="0.05"></div>
+  <div class="field"><label>Dynamic OPEN current</label><select id="dynamicEnabled"><option value="1">Enabled</option><option value="0">Disabled (fixed current)</option></select></div>
+  <div class="field"><label>Dynamic minimum run current A</label><input id="dynamicMin" type="number" step="0.01"></div>
+  <div class="field"><label>Dynamic curve exponent</label><input id="dynamicExponent" type="number" step="0.1"></div>
+  <div class="field"><label>Startup boost current A</label><input id="startupBoost" type="number" step="0.05"></div>
+  <div class="field"><label>Startup boost fade ms</label><input id="startupBoostMs" type="number" step="50"></div>
   <div class="field"><label>Motor voltage limit V (hard max 3 V)</label><input id="voltageLimit" type="number" step="0.1"></div>
   <div class="field"><label>FOC alignment voltage V (current sense / Hall)</label><input id="alignVoltage" type="number" step="0.05"></div>
   <div class="field"><label>Current PI - P</label><input id="currentP" type="number" step="0.01"></div>
@@ -1799,7 +1928,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </div>
 
 <div class="card section note">
- <b>Current mode note:</b> OPEN mode has real phase-current feedback but does not initialize or read the Hall sensor. HALL mode closes both rotor velocity/angle information and current control. All normal speed changes use a monotonic quintic S-curve. OPEN-mode current is softly faded at enable/disable to avoid the zero-speed click. The GUI intentionally makes no periodic network requests while the motor is active.<br><br>
+ <b>Current mode note:</b> OPEN mode has real phase-current feedback but no rotor-angle feedback. Dynamic current changes the q-current request from commanded RPM; it does not measure real RPM or actual load. HALL mode remains unchanged. All normal speed changes use the monotonic quintic S-curve, and the GUI makes no periodic network requests while the motor is active.<br><br>
  <span id="extra"></span>
 </div>
 </div>
@@ -1842,7 +1971,7 @@ function applyStatus(s){
  $('motorCard').textContent=!s.ready?'FAULT':s.retry_pending?'RETRY IN '+Math.ceil(s.retry_remaining_ms/1000)+' s':s.fault_latched?'FAULT LATCHED':s.reversing?'REVERSING / SETTLING':s.enabled?(s.scurve?'RAMPING':'RUNNING'):'STOPPED';
  $('cmdRpm').textContent=f(s.commanded_rpm,0)+' rpm';
  $('measRpm').textContent=s.measured_valid?f(s.measured_rpm,0)+' rpm':'open-loop';
- $('curr').textContent=f(s.iq,2)+' / '+f(s.id,2)+' A';
+ $('curr').textContent=f(s.iq_request,2)+' / '+f(s.iq,2)+' A';
  $('volt').textContent=f(s.uq,2)+' / '+f(s.ud,2)+' V';
  $('wifi').textContent=s.sta_connected?(s.sta_ip+' · '+s.rssi+' dBm'):'AP '+s.ap_ip;
  $('fault').textContent=(s.fault||'')+(s.retry_pending?' — automatic retry '+(s.retry_attempts+1)+'/3; STOP cancels':'');
@@ -1852,7 +1981,7 @@ function applyStatus(s){
  $('hallQuiet').textContent=s.hall_watchdog?s.hall_quiet_ms+' ms':'-';
  $('loopGap').textContent=s.loop_gap_us+' us';
  $('faultLatch').textContent=s.fault_latched?'LATCHED':'CLEAR';
- $('extra').textContent='Current limit '+f(s.current_limit,2)+' A · voltage limit '+f(s.voltage_limit,2)+' V · telemetry + Wi-Fi polling paused while motor runs';
+ $('extra').textContent=(s.dynamic_current?'Dynamic Iq active · ':'Fixed Iq · ')+'hard current '+f(s.current_limit,2)+' A · voltage limit '+f(s.voltage_limit,2)+' V · telemetry + Wi-Fi polling paused while motor runs';
  if(first){dir=s.requested_dir<0?-1:1;setDirUI();$('speed').value=Math.round(s.requested_percent);$('speedText').textContent=Math.round(s.requested_percent);first=false}
 }
 async function refresh(){
@@ -1869,6 +1998,8 @@ async function loadConfig(){
   $('mode').value=c.mode;$('maxRpm').value=c.max_rpm;$('minRpm').value=c.min_rpm;
   const rt=Number(c.max_rpm)/Math.max(Number(c.accel_rpm_s),1);fullRampMs=Math.max(250,Math.min(8000,rt*1000));$('rampTime').value=(fullRampMs/1000).toFixed(2);
   $('currentLimit').value=c.current_limit;$('voltageLimit').value=c.voltage_limit;$('alignVoltage').value=c.align_voltage;
+  $('dynamicEnabled').value=c.dynamic_current_enabled?1:0;$('dynamicMin').value=c.dynamic_min_current;$('dynamicExponent').value=c.dynamic_exponent;
+  $('startupBoost').value=c.startup_boost_current;$('startupBoostMs').value=c.startup_boost_ms;
   $('currentP').value=c.current_p;$('currentI').value=c.current_i;$('currentTf').value=c.current_tf;
   $('velocityP').value=c.velocity_p;$('velocityI').value=c.velocity_i;$('velocityTf').value=c.velocity_tf;
   $('rpmScale').textContent='max '+f(c.max_rpm,0)+' rpm';
@@ -1877,7 +2008,7 @@ async function loadConfig(){
 async function saveSettings(){
  const maxRpm=Math.max(Number($('maxRpm').value),1), rampTime=Math.max(Number($('rampTime').value),0.25);
  const accel=maxRpm/rampTime;
- const obj={mode:$('mode').value,maxRpm:$('maxRpm').value,minRpm:$('minRpm').value,accel,currentLimit:$('currentLimit').value,voltageLimit:$('voltageLimit').value,alignVoltage:$('alignVoltage').value,currentP:$('currentP').value,currentI:$('currentI').value,currentTf:$('currentTf').value,velocityP:$('velocityP').value,velocityI:$('velocityI').value,velocityTf:$('velocityTf').value};
+ const obj={mode:$('mode').value,maxRpm:$('maxRpm').value,minRpm:$('minRpm').value,accel,currentLimit:$('currentLimit').value,voltageLimit:$('voltageLimit').value,alignVoltage:$('alignVoltage').value,dynamicEnabled:$('dynamicEnabled').value,dynamicMin:$('dynamicMin').value,dynamicExponent:$('dynamicExponent').value,startupBoost:$('startupBoost').value,startupBoostMs:$('startupBoostMs').value,currentP:$('currentP').value,currentI:$('currentI').value,currentTf:$('currentTf').value,velocityP:$('velocityP').value,velocityI:$('velocityI').value,velocityTf:$('velocityTf').value};
  stopRefresh();$('settingsMsg').textContent=await post('/api/settings',obj)
 }
 async function recalHall(){if(confirm('Clear saved Hall calibration and restart? The motor may move during calibration.')){stopRefresh();$('settingsMsg').textContent=await post('/api/recal',{})}}
@@ -1903,13 +2034,15 @@ bool parseFiniteNumber(const char* text, float& value) {
 bool validateNumericPost(AsyncWebServerRequest* request) {
   const char* names[] = {"speed", "dir", "mode", "maxRpm", "minRpm", "accel",
     "currentLimit", "voltageLimit", "alignVoltage", "currentP", "currentI",
-    "currentTf", "velocityP", "velocityI", "velocityTf"};
+    "currentTf", "velocityP", "velocityI", "velocityTf", "dynamicEnabled",
+    "dynamicMin", "dynamicExponent", "startupBoost", "startupBoostMs"};
   for (const char* name : names) {
     if (!request->hasParam(name, true)) continue;
     float value;
     if (!parseFiniteNumber(request->getParam(name, true)->value().c_str(), value) ||
         (!strcmp(name, "dir") && value != -1 && value != 1) ||
-        (!strcmp(name, "mode") && value != 0 && value != 1)) {
+        (!strcmp(name, "mode") && value != 0 && value != 1) ||
+        (!strcmp(name, "dynamicEnabled") && value != 0 && value != 1)) {
       request->send(400, "text/plain", "Invalid numeric parameter");
       return false;
     }
@@ -1963,7 +2096,7 @@ size_t buildLiveJson(const Telemetry& t, char* out, size_t outSize) {
     "{\"ready\":%s,\"enabled\":%s,\"reversing\":%s,\"scurve\":%s,"
     "\"mode\":%u,\"requested_percent\":%.1f,\"requested_dir\":%d,"
     "\"commanded_rpm\":%.1f,\"measured_valid\":%s,\"measured_rpm\":%.1f,"
-    "\"iq\":%.3f,\"id\":%.3f,\"uq\":%.3f,\"ud\":%.3f,\"current_limit\":%.3f,\"voltage_limit\":%.3f,"
+    "\"iq\":%.3f,\"id\":%.3f,\"uq\":%.3f,\"ud\":%.3f,\"iq_request\":%.3f,\"dynamic_current\":%s,\"current_limit\":%.3f,\"voltage_limit\":%.3f,"
     "\"hall_rpm\":%.1f,\"hall_watchdog\":%s,\"hall_quiet_ms\":%lu,"
     "\"loop_gap_us\":%lu,\"fault_latched\":%s,\"retry_pending\":%s,"
     "\"retry_attempts\":%u,\"retry_remaining_ms\":%lu,\"sta_connected\":%s,"
@@ -1982,6 +2115,8 @@ size_t buildLiveJson(const Telemetry& t, char* out, size_t outSize) {
     t.idA,
     t.uqV,
     t.udV,
+    t.iqRequestA,
+    t.dynamicCurrentEnabled ? "true" : "false",
     t.currentLimitA,
     t.voltageLimitV,
     t.hallRpm,
@@ -2004,7 +2139,7 @@ size_t buildLiveJson(const Telemetry& t, char* out, size_t outSize) {
   return (size_t)written;
 }
 
-String buildConfigJson(const Config& c) {
+String buildConfigJson(const Config& c, const DynamicCurrentConfig& d) {
   String j;
   j.reserve(500);
   j += "{";
@@ -2022,6 +2157,11 @@ String buildConfigJson(const Config& c) {
   j += ",\"velocity_i\":" + String(c.velocityI, 4);
   j += ",\"velocity_tf\":" + String(c.velocityTf, 5);
   j += ",\"hall_cal_valid\":" + String(c.hallCalValid ? "true" : "false");
+  j += ",\"dynamic_current_enabled\":" + String(d.enabled ? "true" : "false");
+  j += ",\"dynamic_min_current\":" + String(d.minRunCurrentA, 3);
+  j += ",\"dynamic_exponent\":" + String(d.exponent, 2);
+  j += ",\"startup_boost_current\":" + String(d.startupBoostA, 3);
+  j += ",\"startup_boost_ms\":" + String((unsigned long)d.startupBoostMs);
   j += "}";
   return j;
 }
@@ -2048,7 +2188,7 @@ void setupWebServer() {
 
   server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest* request) {
     if (!authorizeRequest(request)) return;
-    const String j = buildConfigJson(configSnapshot());
+    const String j = buildConfigJson(configSnapshot(), dynamicConfigSnapshot());
     AsyncWebServerResponse* response = request->beginResponse(200, "application/json", j);
     response->addHeader("Cache-Control", "no-store");
     request->send(response);
@@ -2104,6 +2244,7 @@ void setupWebServer() {
     if (!authorizeRequest(request)) return;
     if (!validateNumericPost(request)) return;
     Config c = configSnapshot();
+    DynamicCurrentConfig d = dynamicConfigSnapshot();
     c.mode = (uint8_t)postInt(request, "mode", c.mode);
     c.maxRpm = postFloat(request, "maxRpm", c.maxRpm);
     c.minRpm = postFloat(request, "minRpm", c.minRpm);
@@ -2117,11 +2258,18 @@ void setupWebServer() {
     c.velocityP = postFloat(request, "velocityP", c.velocityP);
     c.velocityI = postFloat(request, "velocityI", c.velocityI);
     c.velocityTf = postFloat(request, "velocityTf", c.velocityTf);
+    d.enabled = postInt(request, "dynamicEnabled", d.enabled ? 1 : 0) != 0;
+    d.minRunCurrentA = postFloat(request, "dynamicMin", d.minRunCurrentA);
+    d.exponent = postFloat(request, "dynamicExponent", d.exponent);
+    d.startupBoostA = postFloat(request, "startupBoost", d.startupBoostA);
+    d.startupBoostMs = (uint32_t)max(0, postInt(request, "startupBoostMs", (int)d.startupBoostMs));
     validateConfig(c);
+    validateDynamicCurrentConfig(d);
 
     PendingSettings ps{};
     ps.valid = true;
     ps.value = c;
+    ps.dynamic = d;
 
     portENTER_CRITICAL(&stateMux);
     pendingSettings = ps;
@@ -2222,10 +2370,10 @@ void printSerialStatus() {
     t.commandedRpm
   );
   if (t.measuredRpmValid) Serial.printf("meas=%.0frpm ", t.measuredRpm);
-  Serial.printf("Hall=%.0frpm quiet=%lums watchdog=%d gap=%luus S=%d Iq=%.3fA Id=%.3fA latched=%d fault=%s\n",
+  Serial.printf("Hall=%.0frpm quiet=%lums watchdog=%d gap=%luus S=%d IqReq=%.3fA Iq=%.3fA Id=%.3fA dyn=%d latched=%d fault=%s\n",
                 t.hallRpm, (unsigned long)t.hallQuietMs, t.hallWatchdogEnabled,
-                (unsigned long)t.loopGapUs, t.sCurveActive, t.iqA, t.idA,
-                t.faultLatched, t.fault);
+                (unsigned long)t.loopGapUs, t.sCurveActive, t.iqRequestA, t.iqA, t.idA,
+                t.dynamicCurrentEnabled, t.faultLatched, t.fault);
   Serial.printf("Uq=%.3fV Ud=%.3fV\n", t.uqV, t.udV);
 }
 
@@ -2313,6 +2461,7 @@ void setup() {
     while (true) delay(1000);
   }
   loadConfig();
+  loadDynamicCurrentConfig();
 
   // One-time repair for v0.3.4/v0.3.5 NOHALL builds that could persist
   // HALL_CURRENT_FOC as the default mode in NVS. This commissioning build
@@ -2343,6 +2492,7 @@ void setup() {
     setFault("PREVIOUS_FAULT: inspect hardware, then clear manually");
   }
   publishedConfig = cfg;
+  publishedDynCfg = dynCfg;
 
   setupWiFi();
   setupWebServer();
@@ -2354,6 +2504,9 @@ void setup() {
   Serial.printf("Safety: experimental trips %s; Hall watchdog %s; OPEN mode is Hall-independent\n",
                 ENABLE_EXPERIMENTAL_MOTION_SAFETY ? "ON" : "OFF",
                 (ENABLE_EXPERIMENTAL_MOTION_SAFETY && cfg.mode == HALL_CURRENT_FOC) ? "ON" : "OFF");
+  Serial.printf("Dynamic OPEN current: %s, min %.2fA, exponent %.2f, boost %.2fA/%lums, hard %.2fA\n",
+                dynCfg.enabled ? "ON" : "OFF", dynCfg.minRunCurrentA, dynCfg.exponent,
+                dynCfg.startupBoostA, (unsigned long)dynCfg.startupBoostMs, cfg.currentLimitA);
   Serial.println("Serial commands: status | s 0..100 | f | r | stop | kill | clear");
 }
 
