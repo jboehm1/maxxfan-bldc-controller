@@ -1,0 +1,318 @@
+entLimit').value=c.current_limit;$('voltageLimit').value=c.voltage_limit;$('alignVoltage').value=c.align_voltage;
+   $('currentP').value=c.current_p;$('currentI').value=c.current_i;$('currentTf').value=c.current_tf;
+   $('velocityP').value=c.velocity_p;$('velocityI').value=c.velocity_i;$('velocityTf').value=c.velocity_tf;
+   $('rpmScale').textContent='max '+f(c.max_rpm,0)+' rpm';
+   first=false;
+  }
+  // Do not continuously query the ESP32 while PWM is active: on a small supply
+  // or a busy Wi-Fi task, periodic HTTP/heap activity can modulate the motor.
+  // The screen remains live while stopped and refreshes after an explicit STOP.
+  if(!s.enabled && s.requested_percent<=0.1 && !document.hidden) scheduleRefresh(2000);
+ }catch(e){$('fault').textContent='GUI connection lost — motor state unknown; reconnect to MaxxFan-Setup and open 192.168.4.1';if(!document.hidden)scheduleRefresh(2000)}
+}
+function setDirUI(){$('fwd').classList.toggle('active',dir===1);$('rev').classList.toggle('active',dir===-1)}
+async function saveSettings(){
+ const obj={mode:$('mode').value,maxRpm:$('maxRpm').value,minRpm:$('minRpm').value,accel:$('accel').value,currentLimit:$('currentLimit').value,voltageLimit:$('voltageLimit').value,alignVoltage:$('alignVoltage').value,currentP:$('currentP').value,currentI:$('currentI').value,currentTf:$('currentTf').value,velocityP:$('velocityP').value,velocityI:$('velocityI').value,velocityTf:$('velocityTf').value};
+ $('settingsMsg').textContent=await post('/api/settings',obj);setTimeout(()=>location.reload(),900)
+}
+async function recalHall(){if(confirm('Clear saved Hall calibration and restart? The motor may move during calibration.')){$('settingsMsg').textContent=await post('/api/recal',{});setTimeout(()=>location.reload(),1500)}}
+async function resetDefaults(){if(confirm('Restore safe motor defaults? Wi-Fi credentials are kept.')){$('settingsMsg').textContent=await post('/api/defaults',{});setTimeout(()=>location.reload(),1200)}}
+async function restartEsp(){$('settingsMsg').textContent=await post('/api/restart',{});setTimeout(()=>location.reload(),1200)}
+async function scanWifi(){
+ $('scanMsg').textContent='Scanning 2.4 GHz networks...';
+ try{
+  const r=await fetch('/api/wifi-scan',{cache:'no-store'});
+  if(!r.ok){$('scanMsg').textContent=await r.text();return}
+  const nets=await r.json();
+  const dl=$('wifiList');dl.innerHTML='';
+  const seen=new Set();
+  nets.sort((a,b)=>b.rssi-a.rssi);
+  let count=0;
+  for(const n of nets){
+   if(!n.ssid || seen.has(n.ssid)) continue;
+   seen.add(n.ssid);
+   const o=document.createElement('option');
+   o.value=n.ssid;
+   o.label=n.rssi+' dBm'+(n.secure?' - secured':' - open');
+   dl.appendChild(o);count++;
+  }
+  $('scanMsg').textContent=count?count+' network(s) found. Click the SSID field to choose.':'No visible network found.';
+ }catch(e){$('scanMsg').textContent='Wi-Fi scan failed'}
+}
+async function saveWifi(){$('wifiMsg').textContent=await post('/api/wifi',{ssid:$('ssid').value,pass:$('pass').value});setTimeout(()=>location.reload(),1800)}
+document.addEventListener('visibilitychange',()=>{if(document.hidden)stopRefresh();else refresh()});
+refresh();
+</script></body></html>
+)rawliteral";
+
+bool requirePostParam(AsyncWebServerRequest* request, const char* name) {
+  return request->hasParam(name, true);
+}
+
+bool parseFiniteNumber(const char* text, float& value) {
+  if (!text || !*text) return false;
+  char* end = nullptr;
+  errno = 0;
+  value = strtof(text, &end);
+  return end != text && *end == '\0' && errno != ERANGE && isfinite(value);
+}
+bool validateNumericPost(AsyncWebServerRequest* request) {
+  const char* names[] = {"speed", "dir", "mode", "maxRpm", "minRpm", "accel",
+    "currentLimit", "voltageLimit", "alignVoltage", "currentP", "currentI",
+    "currentTf", "velocityP", "velocityI", "velocityTf"};
+  for (const char* name : names) {
+    if (!request->hasParam(name, true)) continue;
+    float value;
+    if (!parseFiniteNumber(request->getParam(name, true)->value().c_str(), value) ||
+        (!strcmp(name, "dir") && value != -1 && value != 1) ||
+        (!strcmp(name, "mode") && value != 0 && value != 1)) {
+      request->send(400, "text/plain", "Invalid numeric parameter");
+      return false;
+    }
+  }
+  return true;
+}
+float postFloat(AsyncWebServerRequest* request, const char* name, float fallback) {
+  if (!request->hasParam(name, true)) return fallback;
+  float value;
+  return parseFiniteNumber(request->getParam(name, true)->value().c_str(), value)
+    ? value : fallback;
+}
+
+int postInt(AsyncWebServerRequest* request, const char* name, int fallback) {
+  if (!request->hasParam(name, true)) return fallback;
+  return request->getParam(name, true)->value().toInt();
+}
+
+bool authorizeRequest(AsyncWebServerRequest* request) {
+  if (!request->authenticate("admin", AP_PASSWORD)) {
+    request->requestAuthentication();
+    return false;
+  }
+  // Cross-origin forms cannot provide this header; no CORS permission is sent.
+  if (request->method() == HTTP_POST &&
+      (!request->hasHeader("X-MaxxFan-Control") ||
+       request->getHeader("X-MaxxFan-Control")->value() != "1")) {
+    request->send(403, "text/plain", "Missing control header");
+    return false;
+  }
+  return true;
+}
+void setupWebServer() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    request->send_P(200, "text/html", INDEX_HTML);
+  });
+
+  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    const Telemetry t = telemetrySnapshot();
+    const Config c = configSnapshot();
+
+    String j;
+    j.reserve(1050);
+    j += "{";
+    j += "\"ready\":" + String(t.motorReady ? "true" : "false");
+    j += ",\"enabled\":" + String(t.enabled ? "true" : "false");
+    j += ",\"reversing\":" + String(t.reversing ? "true" : "false");
+    j += ",\"mode\":" + String((int)t.mode);
+    j += ",\"requested_percent\":" + String(t.requestedPercent, 1);
+    j += ",\"requested_dir\":" + String((int)t.requestedDirection);
+    j += ",\"commanded_rpm\":" + String(t.commandedRpm, 1);
+    j += ",\"measured_valid\":" + String(t.measuredRpmValid ? "true" : "false");
+    j += ",\"measured_rpm\":" + String(t.measuredRpm, 1);
+    j += ",\"iq\":" + String(t.iqA, 3);
+    j += ",\"id\":" + String(t.idA, 3);
+    j += ",\"current_limit\":" + String(t.currentLimitA, 3);
+    j += ",\"voltage_limit\":" + String(t.voltageLimitV, 3);
+    j += ",\"hall_transitions\":" + String(t.hallTransitions);
+    j += ",\"hall_rpm\":" + String(t.hallRpm, 1);
+    j += ",\"hall_watchdog\":" + String(t.hallWatchdogEnabled ? "true" : "false");
+    j += ",\"hall_quiet_ms\":" + String(t.hallQuietMs);
+    j += ",\"fault_latched\":" + String(t.faultLatched ? "true" : "false");
+    j += ",\"retry_pending\":" + String(t.retryPending ? "true" : "false");
+    j += ",\"retry_attempts\":" + String(t.retryAttempts);
+    j += ",\"retry_remaining_ms\":" + String(t.retryRemainingMs);
+    j += ",\"sta_connected\":" + String(t.staConnected ? "true" : "false");
+    j += ",\"rssi\":" + String(t.wifiRssi);
+    j += ",\"sta_ip\":\"" + jsonEscape(t.staIp) + "\"";
+    j += ",\"ap_ip\":\"" + jsonEscape(t.apIp) + "\"";
+    j += ",\"ssid\":\"" + jsonEscape(t.staSsid) + "\"";
+    j += ",\"fault\":\"" + jsonEscape(t.fault) + "\"";
+    j += ",\"config\":{";
+    j += "\"mode\":" + String((int)c.mode);
+    j += ",\"max_rpm\":" + String(c.maxRpm, 1);
+    j += ",\"min_rpm\":" + String(c.minRpm, 1);
+    j += ",\"accel_rpm_s\":" + String(c.accelRpmPerSec, 1);
+    j += ",\"current_limit\":" + String(c.currentLimitA, 3);
+    j += ",\"voltage_limit\":" + String(c.motorVoltageLimitV, 3);
+    j += ",\"align_voltage\":" + String(c.alignVoltageV, 3);
+    j += ",\"current_p\":" + String(c.currentP, 4);
+    j += ",\"current_i\":" + String(c.currentI, 3);
+    j += ",\"current_tf\":" + String(c.currentTf, 5);
+    j += ",\"velocity_p\":" + String(c.velocityP, 5);
+    j += ",\"velocity_i\":" + String(c.velocityI, 4);
+    j += ",\"velocity_tf\":" + String(c.velocityTf, 5);
+    j += ",\"hall_cal_valid\":" + String(c.hallCalValid ? "true" : "false");
+    j += "}}";
+
+    AsyncWebServerResponse* response = request->beginResponse(200, "application/json", j);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+  });
+
+  server.on("/api/control", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    if (!validateNumericPost(request)) return;
+    if (request->hasParam("speed", true) && postFloat(request, "speed", -1) == 0) {
+      portENTER_CRITICAL(&stateMux);
+      pendingStop = true;
+      portEXIT_CRITICAL(&stateMux);
+      request->send(200, "text/plain", "Stop requested; automatic retry cancelled.");
+      return;
+    }
+    if (telemetrySnapshot().faultLatched) {
+      request->send(409, "text/plain", "Recovery pending or fault latched. STOP cancels; clear leaves stopped.");
+      return;
+    }
+    if (!requirePostParam(request, "speed") || !requirePostParam(request, "dir")) {
+      request->send(400, "text/plain", "Missing speed/dir");
+      return;
+    }
+    PendingControl pc{};
+    pc.valid = true;
+    pc.percent = clampf(postFloat(request, "speed", 0.0f), 0.0f, 100.0f);
+    pc.direction = postInt(request, "dir", 1) < 0 ? -1 : 1;
+
+    portENTER_CRITICAL(&stateMux);
+    pendingControl = pc;
+    portEXIT_CRITICAL(&stateMux);
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/api/stop", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    portENTER_CRITICAL(&stateMux);
+    pendingStop = true;
+    portEXIT_CRITICAL(&stateMux);
+    request->send(200, "text/plain", "Stop requested");
+  });
+
+  server.on("/api/clear-fault", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    portENTER_CRITICAL(&stateMux);
+    pendingClearFault = true;
+    portEXIT_CRITICAL(&stateMux);
+    request->send(200, "text/plain", "Fault clear requested. Motor remains stopped.");
+  });
+
+  server.on("/api/settings", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    if (!validateNumericPost(request)) return;
+    Config c = configSnapshot();
+    c.mode = (uint8_t)postInt(request, "mode", c.mode);
+    c.maxRpm = postFloat(request, "maxRpm", c.maxRpm);
+    c.minRpm = postFloat(request, "minRpm", c.minRpm);
+    c.accelRpmPerSec = postFloat(request, "accel", c.accelRpmPerSec);
+    c.currentLimitA = postFloat(request, "currentLimit", c.currentLimitA);
+    c.motorVoltageLimitV = postFloat(request, "voltageLimit", c.motorVoltageLimitV);
+    c.alignVoltageV = postFloat(request, "alignVoltage", c.alignVoltageV);
+    c.currentP = postFloat(request, "currentP", c.currentP);
+    c.currentI = postFloat(request, "currentI", c.currentI);
+    c.currentTf = postFloat(request, "currentTf", c.currentTf);
+    c.velocityP = postFloat(request, "velocityP", c.velocityP);
+    c.velocityI = postFloat(request, "velocityI", c.velocityI);
+    c.velocityTf = postFloat(request, "velocityTf", c.velocityTf);
+    validateConfig(c);
+
+    PendingSettings ps{};
+    ps.valid = true;
+    ps.value = c;
+
+    portENTER_CRITICAL(&stateMux);
+    pendingSettings = ps;
+    portEXIT_CRITICAL(&stateMux);
+
+    request->send(200, "text/plain", "Settings accepted. Mode changes reboot automatically.");
+  });
+
+  server.on("/api/wifi-scan", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    const Telemetry t = telemetrySnapshot();
+
+    // Synchronous radio scanning is permitted only with the motor fully off.
+    if (t.enabled || t.reversing || t.requestedPercent > 0.1f ||
+        scheduledRestartAtMs != 0) {
+      request->send(409, "text/plain",
+                    "Stop the motor completely before scanning Wi-Fi.");
+      return;
+    }
+
+    const int count = WiFi.scanNetworks(false, true);
+    if (count < 0) {
+      request->send(500, "text/plain", "Wi-Fi scan failed.");
+      return;
+    }
+
+    String json;
+    json.reserve(32 + count * 72);
+    json += "[";
+
+    for (int i = 0; i < count; ++i) {
+      if (i) json += ",";
+      json += "{\"ssid\":\"";
+      json += jsonEscape(WiFi.SSID(i).c_str());
+      json += "\",\"rssi\":";
+      json += String(WiFi.RSSI(i));
+      json += ",\"secure\":";
+      json += (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "false" : "true";
+      json += "}";
+    }
+
+    json += "]";
+    WiFi.scanDelete();
+
+    AsyncWebServerResponse* response =
+      request->beginResponse(200, "application/json", json);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+  });
+
+  server.on("/api/wifi", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    if (!request->hasParam("ssid", true)) {
+      request->send(400, "text/plain", "Missing SSID");
+      return;
+    }
+    String ssid = request->getParam("ssid", true)->value();
+    String pass = request->hasParam("pass", true) ? request->getParam("pass", true)->value() : "";
+    ssid.trim();
+    if (ssid.length() > 32 || pass.length() > 64) {
+      request->send(400, "text/plain", "SSID/password too long");
+      return;
+    }
+
+    PendingWifi p{};
+    p.valid = true;
+    strncpy(p.ssid, ssid.c_str(), sizeof(p.ssid) - 1);
+    strncpy(p.password, pass.c_str(), sizeof(p.password) - 1);
+
+    portENTER_CRITICAL(&stateMux);
+    pendingWifi = p;
+    portEXIT_CRITICAL(&stateMux);
+
+    request->send(200, "text/plain", "Wi-Fi saved. Restarting...");
+  });
+
+  server.on("/api/recal", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    portENTER_CRITICAL(&stateMux);
+    pendingRecalibrate = true;
+    portEXIT_CRITICAL(&stateMux);
+    request->send(200, "text/plain", "Hall calibration cleared. Restarting...");
+  });
+
+  server.on("/api/defaults", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    portENTER_CRITICAL(&stateMux);
+    
