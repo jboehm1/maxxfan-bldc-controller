@@ -1,0 +1,1 @@
+Temporary note created during branch graph cleanup; safe to delete after refs are normalized.
