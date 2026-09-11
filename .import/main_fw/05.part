@@ -1,0 +1,191 @@
+pendingDefaults = true;
+    portEXIT_CRITICAL(&stateMux);
+    request->send(200, "text/plain", "Safe defaults restored. Restarting...");
+  });
+
+  server.on("/api/restart", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    portENTER_CRITICAL(&stateMux);
+    pendingRestart = true;
+    portEXIT_CRITICAL(&stateMux);
+    request->send(200, "text/plain", "Restarting...");
+  });
+
+  server.onNotFound([](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    request->send(404, "text/plain", "Not found");
+  });
+
+  server.begin();
+  Serial.println("Web server started.");
+}
+
+// ============================================================================
+// 16. SERIAL - intentionally quiet unless requested
+// ============================================================================
+
+void printSerialStatus() {
+  if (Serial.availableForWrite() < 400) return;
+  Telemetry t = telemetrySnapshot();
+  Serial.printf("retry_pending=%d attempts=%u/3 cooldown=%lums ",
+    t.retryPending, t.retryAttempts, (unsigned long)t.retryRemainingMs);
+  Serial.printf(
+    "mode=%s ready=%d enabled=%d req=%.0f%% dir=%d cmd=%.0frpm ",
+    t.mode == HALL_CURRENT_FOC ? "HALL" : "OPEN",
+    t.motorReady,
+    t.enabled,
+    t.requestedPercent,
+    t.requestedDirection,
+    t.commandedRpm
+  );
+  if (t.measuredRpmValid) Serial.printf("meas=%.0frpm ", t.measuredRpm);
+  Serial.printf("Hall=%.0frpm quiet=%lums watchdog=%d Iq=%.3fA Id=%.3fA latched=%d fault=%s\n",
+                t.hallRpm, (unsigned long)t.hallQuietMs, t.hallWatchdogEnabled,
+                t.iqA, t.idA, t.faultLatched, t.fault);
+}
+
+void handleSerial() {
+  static char buf[48];
+  static size_t n = 0;
+  static bool overflow = false;
+  unsigned budget = 32;
+  while (budget-- && Serial.available()) {
+    char ch = (char)Serial.read();
+    if (ch == '\r') continue;
+    if (ch == '\n') {
+      if (overflow) { n = 0; overflow = false; continue; }
+      buf[n] = 0;
+      n = 0;
+      String s(buf);
+      s.trim();
+      s.toLowerCase();
+      if (s == "?" || s == "status") {
+        printSerialStatus();
+      } else if (s == "stop" || s == "x") {
+        retryPolicy.cancel();
+        requestedPercent = 0.0f;
+        Serial.println("Stop requested");
+      } else if (s == "clear") {
+        clearSafetyFault();
+      } else if (s == "mode open") {
+        retryPolicy.cancel();
+        requestedPercent = 0.0f;
+        disableMotorNow();
+        cfg.mode = OPEN_CURRENT_FOC;
+        saveConfig();
+        Serial.println("Mode saved: OPEN_CURRENT_FOC. Restarting...");
+        scheduleRestart(500);
+      } else if (s == "mode hall") {
+        retryPolicy.cancel();
+        requestedPercent = 0.0f;
+        disableMotorNow();
+        cfg.mode = HALL_CURRENT_FOC;
+        saveConfig();
+        Serial.println("Mode saved: HALL_CURRENT_FOC. Restarting...");
+        scheduleRestart(500);
+      } else if (s == "f") {
+        retryPolicy.cancel();
+        requestedDirection = 1;
+        Serial.println("Direction: forward");
+      } else if (s == "r") {
+        retryPolicy.cancel();
+        requestedDirection = -1;
+        Serial.println("Direction: reverse");
+      } else if (s.startsWith("s ")) {
+        float stopValue;
+        if (parseFiniteNumber(s.substring(2).c_str(), stopValue) && stopValue == 0) {
+          retryPolicy.cancel();
+          requestedPercent = 0;
+          continue;
+        }
+        if (safetyFaultLatched) {
+          Serial.println("Safety fault is latched. Use: clear");
+        } else {
+          float value;
+          if (!parseFiniteNumber(s.substring(2).c_str(), value)) continue;
+          requestedPercent = clampf(value, 0.0f, 100.0f);
+          Serial.printf("Speed request: %.0f%%\n", requestedPercent);
+        }
+      } else if (s.length()) {
+        Serial.println("Commands: status | mode open | mode hall | s 0..100 | f | r | stop | clear");
+      }
+    } else if (n < sizeof(buf) - 1) {
+      buf[n++] = ch;
+    } else {
+      overflow = true;
+    }
+  }
+}
+
+// ============================================================================
+// 17. ARDUINO SETUP / LOOP
+// ============================================================================
+
+void setup() {
+  pinMode(PIN_ENABLE, OUTPUT);
+  digitalWrite(PIN_ENABLE, LOW);
+  Serial.setTxBufferSize(1024);
+  Serial.begin(115200);
+  delay(150);
+  Serial.println();
+  Serial.print("=== MaxxFan MKS ESP32 FOC Mega v");
+  Serial.print(FIRMWARE_VERSION);
+  Serial.println(" ===");
+  Serial.println("Required library: SimpleFOC 2.4.0");
+
+  if (!prefs.begin("maxxfan", false)) {
+    Serial.println("FATAL: NVS unavailable; driver disabled");
+    while (true) delay(1000);
+  }
+  loadConfig();
+
+  Serial.print("Control mode: ");
+  Serial.println(cfg.mode == HALL_CURRENT_FOC ? "HALL_CURRENT_FOC" : "OPEN_CURRENT_FOC");
+
+  // Clear an old experimental safety latch so a previous WINDMILL test cannot
+  // prevent this commissioning build from initializing.
+  if (!ENABLE_EXPERIMENTAL_MOTION_SAFETY) prefs.putBool("safetytrip", false);
+  const bool persistedFault = ENABLE_EXPERIMENTAL_MOTION_SAFETY &&
+                             prefs.getBool("safetytrip", false);
+
+  // Start connectivity before any driver/current-sense/FOC initialization.
+  // If motor setup fails or takes time, MaxxFan-Setup remains reachable for
+  // diagnosis instead of leaving the browser with a connection timeout.
+  publishedConfig = cfg;
+  setupWiFi();
+  setupWebServer();
+  updateTelemetry();
+
+  motorReady = setupMotor();
+  if (!motorReady) disableMotorNow();
+  if (persistedFault) {
+    safetyFaultLatched = true;
+    setFault("PREVIOUS_FAULT: inspect hardware, then clear manually");
+  }
+  publishedConfig = cfg;
+  updateTelemetry();
+
+  Serial.println("GUI recovery AP: MaxxFan-Setup / MaxxFan123");
+  Serial.println("GUI URL: http://192.168.4.1  or  http://maxxfan.local");
+  Serial.println("Open: http://192.168.4.1");
+  Serial.println("OPEN mode: Hall completely OFF; physical current feedback only.");
+  Serial.println("Experimental motion safety: DISABLED for commissioning.");
+  Serial.println("Serial commands: status | mode open | mode hall | s 0..100 | f | r | stop | clear");
+}
+
+void loop() {
+  // Motor loop first and as frequently as possible.
+  runMotorControl();
+
+  processPendingCommands();
+  updateTelemetry();
+  handleSerial();
+  serviceAutoRecovery();
+
+  if (scheduledRestartAtMs && (int32_t)(millis() - scheduledRestartAtMs) >= 0) {
+    requestedPercent = 0.0f;
+    disableMotorNow();
+    delay(20);
+    ESP.restart();
+  }
+}
