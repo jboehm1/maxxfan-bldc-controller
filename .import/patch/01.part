@@ -1,0 +1,179 @@
+"startupBoostMs" type="number" step="50"></div>
+   <div class="field"><label>Motor voltage limit V (hard max 3 V)</label><input id="voltageLimit" type="number" step="0.1"></div>
+   <div class="field"><label>FOC alignment voltage V (current sense / Hall)</label><input id="alignVoltage" type="number" step="0.05"></div>
+   <div class="field"><label>Current PI - P</label><input id="currentP" type="number" step="0.01"></div>
+@@ -1799,7 +1928,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
+ </div>
+ 
+ <div class="card section note">
+- <b>Current mode note:</b> OPEN mode has real phase-current feedback but does not initialize or read the Hall sensor. HALL mode closes both rotor velocity/angle information and current control. All normal speed changes use a monotonic quintic S-curve. OPEN-mode current is softly faded at enable/disable to avoid the zero-speed click. The GUI intentionally makes no periodic network requests while the motor is active.<br><br>
++ <b>Current mode note:</b> OPEN mode has real phase-current feedback but no rotor-angle feedback. Dynamic current changes the q-current request from commanded RPM; it does not measure real RPM or actual load. HALL mode remains unchanged. All normal speed changes use the monotonic quintic S-curve, and the GUI makes no periodic network requests while the motor is active.<br><br>
+  <span id="extra"></span>
+ </div>
+ </div>
+@@ -1842,7 +1971,7 @@ function applyStatus(s){
+  $('motorCard').textContent=!s.ready?'FAULT':s.retry_pending?'RETRY IN '+Math.ceil(s.retry_remaining_ms/1000)+' s':s.fault_latched?'FAULT LATCHED':s.reversing?'REVERSING / SETTLING':s.enabled?(s.scurve?'RAMPING':'RUNNING'):'STOPPED';
+  $('cmdRpm').textContent=f(s.commanded_rpm,0)+' rpm';
+  $('measRpm').textContent=s.measured_valid?f(s.measured_rpm,0)+' rpm':'open-loop';
+- $('curr').textContent=f(s.iq,2)+' / '+f(s.id,2)+' A';
++ $('curr').textContent=f(s.iq_request,2)+' / '+f(s.iq,2)+' A';
+  $('volt').textContent=f(s.uq,2)+' / '+f(s.ud,2)+' V';
+  $('wifi').textContent=s.sta_connected?(s.sta_ip+' · '+s.rssi+' dBm'):'AP '+s.ap_ip;
+  $('fault').textContent=(s.fault||'')+(s.retry_pending?' — automatic retry '+(s.retry_attempts+1)+'/3; STOP cancels':'');
+@@ -1852,7 +1981,7 @@ function applyStatus(s){
+  $('hallQuiet').textContent=s.hall_watchdog?s.hall_quiet_ms+' ms':'-';
+  $('loopGap').textContent=s.loop_gap_us+' us';
+  $('faultLatch').textContent=s.fault_latched?'LATCHED':'CLEAR';
+- $('extra').textContent='Current limit '+f(s.current_limit,2)+' A · voltage limit '+f(s.voltage_limit,2)+' V · telemetry + Wi-Fi polling paused while motor runs';
++ $('extra').textContent=(s.dynamic_current?'Dynamic Iq active · ':'Fixed Iq · ')+'hard current '+f(s.current_limit,2)+' A · voltage limit '+f(s.voltage_limit,2)+' V · telemetry + Wi-Fi polling paused while motor runs';
+  if(first){dir=s.requested_dir<0?-1:1;setDirUI();$('speed').value=Math.round(s.requested_percent);$('speedText').textContent=Math.round(s.requested_percent);first=false}
+ }
+ async function refresh(){
+@@ -1869,6 +1998,8 @@ async function loadConfig(){
+   $('mode').value=c.mode;$('maxRpm').value=c.max_rpm;$('minRpm').value=c.min_rpm;
+   const rt=Number(c.max_rpm)/Math.max(Number(c.accel_rpm_s),1);fullRampMs=Math.max(250,Math.min(8000,rt*1000));$('rampTime').value=(fullRampMs/1000).toFixed(2);
+   $('currentLimit').value=c.current_limit;$('voltageLimit').value=c.voltage_limit;$('alignVoltage').value=c.align_voltage;
++  $('dynamicEnabled').value=c.dynamic_current_enabled?1:0;$('dynamicMin').value=c.dynamic_min_current;$('dynamicExponent').value=c.dynamic_exponent;
++  $('startupBoost').value=c.startup_boost_current;$('startupBoostMs').value=c.startup_boost_ms;
+   $('currentP').value=c.current_p;$('currentI').value=c.current_i;$('currentTf').value=c.current_tf;
+   $('velocityP').value=c.velocity_p;$('velocityI').value=c.velocity_i;$('velocityTf').value=c.velocity_tf;
+   $('rpmScale').textContent='max '+f(c.max_rpm,0)+' rpm';
+@@ -1877,7 +2008,7 @@ async function loadConfig(){
+ async function saveSettings(){
+  const maxRpm=Math.max(Number($('maxRpm').value),1), rampTime=Math.max(Number($('rampTime').value),0.25);
+  const accel=maxRpm/rampTime;
+- const obj={mode:$('mode').value,maxRpm:$('maxRpm').value,minRpm:$('minRpm').value,accel,currentLimit:$('currentLimit').value,voltageLimit:$('voltageLimit').value,alignVoltage:$('alignVoltage').value,currentP:$('currentP').value,currentI:$('currentI').value,currentTf:$('currentTf').value,velocityP:$('velocityP').value,velocityI:$('velocityI').value,velocityTf:$('velocityTf').value};
++ const obj={mode:$('mode').value,maxRpm:$('maxRpm').value,minRpm:$('minRpm').value,accel,currentLimit:$('currentLimit').value,voltageLimit:$('voltageLimit').value,alignVoltage:$('alignVoltage').value,dynamicEnabled:$('dynamicEnabled').value,dynamicMin:$('dynamicMin').value,dynamicExponent:$('dynamicExponent').value,startupBoost:$('startupBoost').value,startupBoostMs:$('startupBoostMs').value,currentP:$('currentP').value,currentI:$('currentI').value,currentTf:$('currentTf').value,velocityP:$('velocityP').value,velocityI:$('velocityI').value,velocityTf:$('velocityTf').value};
+  stopRefresh();$('settingsMsg').textContent=await post('/api/settings',obj)
+ }
+ async function recalHall(){if(confirm('Clear saved Hall calibration and restart? The motor may move during calibration.')){stopRefresh();$('settingsMsg').textContent=await post('/api/recal',{})}}
+@@ -1903,13 +2034,15 @@ bool parseFiniteNumber(const char* text, float& value) {
+ bool validateNumericPost(AsyncWebServerRequest* request) {
+   const char* names[] = {"speed", "dir", "mode", "maxRpm", "minRpm", "accel",
+     "currentLimit", "voltageLimit", "alignVoltage", "currentP", "currentI",
+-    "currentTf", "velocityP", "velocityI", "velocityTf"};
++    "currentTf", "velocityP", "velocityI", "velocityTf", "dynamicEnabled",
++    "dynamicMin", "dynamicExponent", "startupBoost", "startupBoostMs"};
+   for (const char* name : names) {
+     if (!request->hasParam(name, true)) continue;
+     float value;
+     if (!parseFiniteNumber(request->getParam(name, true)->value().c_str(), value) ||
+         (!strcmp(name, "dir") && value != -1 && value != 1) ||
+-        (!strcmp(name, "mode") && value != 0 && value != 1)) {
++        (!strcmp(name, "mode") && value != 0 && value != 1) ||
++        (!strcmp(name, "dynamicEnabled") && value != 0 && value != 1)) {
+       request->send(400, "text/plain", "Invalid numeric parameter");
+       return false;
+     }
+@@ -1963,7 +2096,7 @@ size_t buildLiveJson(const Telemetry& t, char* out, size_t outSize) {
+     "{\"ready\":%s,\"enabled\":%s,\"reversing\":%s,\"scurve\":%s,"
+     "\"mode\":%u,\"requested_percent\":%.1f,\"requested_dir\":%d,"
+     "\"commanded_rpm\":%.1f,\"measured_valid\":%s,\"measured_rpm\":%.1f,"
+-    "\"iq\":%.3f,\"id\":%.3f,\"uq\":%.3f,\"ud\":%.3f,\"current_limit\":%.3f,\"voltage_limit\":%.3f,"
++    "\"iq\":%.3f,\"id\":%.3f,\"uq\":%.3f,\"ud\":%.3f,\"iq_request\":%.3f,\"dynamic_current\":%s,\"current_limit\":%.3f,\"voltage_limit\":%.3f,"
+     "\"hall_rpm\":%.1f,\"hall_watchdog\":%s,\"hall_quiet_ms\":%lu,"
+     "\"loop_gap_us\":%lu,\"fault_latched\":%s,\"retry_pending\":%s,"
+     "\"retry_attempts\":%u,\"retry_remaining_ms\":%lu,\"sta_connected\":%s,"
+@@ -1982,6 +2115,8 @@ size_t buildLiveJson(const Telemetry& t, char* out, size_t outSize) {
+     t.idA,
+     t.uqV,
+     t.udV,
++    t.iqRequestA,
++    t.dynamicCurrentEnabled ? "true" : "false",
+     t.currentLimitA,
+     t.voltageLimitV,
+     t.hallRpm,
+@@ -2004,7 +2139,7 @@ size_t buildLiveJson(const Telemetry& t, char* out, size_t outSize) {
+   return (size_t)written;
+ }
+ 
+-String buildConfigJson(const Config& c) {
++String buildConfigJson(const Config& c, const DynamicCurrentConfig& d) {
+   String j;
+   j.reserve(500);
+   j += "{";
+@@ -2022,6 +2157,11 @@ String buildConfigJson(const Config& c) {
+   j += ",\"velocity_i\":" + String(c.velocityI, 4);
+   j += ",\"velocity_tf\":" + String(c.velocityTf, 5);
+   j += ",\"hall_cal_valid\":" + String(c.hallCalValid ? "true" : "false");
++  j += ",\"dynamic_current_enabled\":" + String(d.enabled ? "true" : "false");
++  j += ",\"dynamic_min_current\":" + String(d.minRunCurrentA, 3);
++  j += ",\"dynamic_exponent\":" + String(d.exponent, 2);
++  j += ",\"startup_boost_current\":" + String(d.startupBoostA, 3);
++  j += ",\"startup_boost_ms\":" + String((unsigned long)d.startupBoostMs);
+   j += "}";
+   return j;
+ }
+@@ -2048,7 +2188,7 @@ void setupWebServer() {
+ 
+   server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest* request) {
+     if (!authorizeRequest(request)) return;
+-    const String j = buildConfigJson(configSnapshot());
++    const String j = buildConfigJson(configSnapshot(), dynamicConfigSnapshot());
+     AsyncWebServerResponse* response = request->beginResponse(200, "application/json", j);
+     response->addHeader("Cache-Control", "no-store");
+     request->send(response);
+@@ -2104,6 +2244,7 @@ void setupWebServer() {
+     if (!authorizeRequest(request)) return;
+     if (!validateNumericPost(request)) return;
+     Config c = configSnapshot();
++    DynamicCurrentConfig d = dynamicConfigSnapshot();
+     c.mode = (uint8_t)postInt(request, "mode", c.mode);
+     c.maxRpm = postFloat(request, "maxRpm", c.maxRpm);
+     c.minRpm = postFloat(request, "minRpm", c.minRpm);
+@@ -2117,11 +2258,18 @@ void setupWebServer() {
+     c.velocityP = postFloat(request, "velocityP", c.velocityP);
+     c.velocityI = postFloat(request, "velocityI", c.velocityI);
+     c.velocityTf = postFloat(request, "velocityTf", c.velocityTf);
++    d.enabled = postInt(request, "dynamicEnabled", d.enabled ? 1 : 0) != 0;
++    d.minRunCurrentA = postFloat(request, "dynamicMin", d.minRunCurrentA);
++    d.exponent = postFloat(request, "dynamicExponent", d.exponent);
++    d.startupBoostA = postFloat(request, "startupBoost", d.startupBoostA);
++    d.startupBoostMs = (uint32_t)max(0, postInt(request, "startupBoostMs", (int)d.startupBoostMs));
+     validateConfig(c);
++    validateDynamicCurrentConfig(d);
+ 
+     PendingSettings ps{};
+     ps.valid = true;
+     ps.value = c;
++    ps.dynamic = d;
+ 
+     portENTER_CRITICAL(&stateMux);
+     pendingSettings = ps;
+@@ -2222,10 +2370,10 @@ void printSerialStatus() {
+     t.commandedRpm
+   );
+   if (t.measuredRpmValid) Serial.printf("meas=%.0frpm ", t.measuredRpm);
+-  Serial.printf("Hall=%.0frpm quiet=%lums watchdog=%d gap=%luus S=%d Iq=%.3fA Id=%.3fA latched=%d fault=%s\n",
++  Serial.printf("Hall=%.0frpm quiet=%lums watchdog=%d gap=%luus S=%d IqReq=%.3fA Iq=%.3fA Id=%.3fA dyn=%d latched=%d fault=%s\n",
+                 t.hallRpm, (unsigned long)t.hallQuietMs, t.hallWatchdogEnabled,
+-                (unsigned long)t.loopGapUs, t.sCurveActive, t.iqA, t.idA,
+-                t.faultLatched, t.fault);
++                (unsigned long)t.loopGapUs, t.sCurveActive, t.iqRequestA, t.iqA, t.idA,
++                t.dynamicCurrentEnabled, t.faultLatched, t.fault);
+   Serial.printf("Uq=%.3fV Ud=%.3fV\n", t.uqV, t.udV);
+ }
+ 
+@@ -2313,6 +2461,7 @@ void setup() {
+     while (true) delay(1000);
+   }
+   loadConfig();
++  loadDynamicCurrentConfig();
+ 
+   // One-time repair for v0.3.4/v0.3.5 NOHALL builds that could persist
+   // HALL_CURRENT_FOC as the default mode in NVS. This commissioning build
+@@ -2343,6 +2492,7 @@ void setup() {
+     setFault("PREVIOUS_FAULT: inspect hardware, then clear manually");
+   }
+   publishedConfig = cfg;
++  publishedDynCfg = dynCfg;
+ 
+   setupWiFi();
+   setupWebServer();
+@@ -2354,6 +2504,9 @@ void setup() {
+   Serial.printf("Safety: experimental trips %s; Hall watchdog %s; OPEN mode is Hall-independent\n",
+                 ENABLE_EXPERIMENTAL_MOTION_SAFETY ? "ON" : "OFF",
+                 (ENABLE_EXPERIMENTAL_MOTION_SAFETY && cfg.mode == HALL_CURRENT_FOC) ? "ON" : "OFF");
++  Serial.printf("Dynamic OPEN current: %s, min %.2fA, exponent %.2f, boost %.2fA/%lums, hard %.2fA\n",
++                dynCfg.enabled ? "ON" : "OFF", dynCfg.minRunCurrentA, dynCfg.exponent,
++                dynCfg.startupBoostA, (
