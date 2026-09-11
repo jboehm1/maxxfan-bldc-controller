@@ -1,6 +1,6 @@
 /*
   ============================================================================
-  MaxxFan Sensorless Flux Observer Probe
+  MaxxFan Sensorless Flux Observer Probe - v0.4.0-sensorless.1
   Branch : research/sensorless-foc
   Status : PASSIVE OBSERVER ONLY - NOT CLOSED-LOOP SENSORLESS CONTROL
 
@@ -27,6 +27,8 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+
+static constexpr const char* SENSORLESS_PROBE_VERSION = "0.4.0-sensorless.1";
 
 // MKS ESP32 FOC Mega motor-0 mapping verified against Makerbase examples.
 static constexpr int PIN_PWM_U = 32;
