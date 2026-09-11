@@ -1,0 +1,430 @@
+;
+volatile bool pendingRecalibrate = false;
+volatile bool pendingDefaults = false;
+volatile bool pendingRestart = false;
+
+// ============================================================================
+// 7. MOTOR RUNTIME STATE
+// ============================================================================
+
+bool motorReady = false;
+bool motorEnabled = false;
+bool reversalPending = false;
+bool reversePauseActive = false;
+
+float requestedPercent = 0.0f;
+int8_t requestedDirection = 1;
+int8_t driveDirection = 1;
+float rampedRadPerSec = 0.0f;
+
+struct SCurveState {
+  bool active = false;
+  float target = 0.0f;
+  uint32_t startedUs = 0;
+  uint32_t durationUs = 0;
+  // omega(tau) = c0 + c1*tau + ... + c5*tau^5, tau in [0,1].
+  // Every retarget starts from the CURRENT commanded speed and uses the classic
+  // 6x^5-15x^4+10x^3 smootherstep shape. This guarantees a monotonic command
+  // and avoids the old mid-ramp reversal overshoot caused by preserving an
+  // acceleration that was pointing away from the new target.
+  float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f, c4 = 0.0f, c5 = 0.0f;
+};
+SCurveState speedCurve;
+
+float openCurrentScale = 0.0f;
+bool openCurrentFadeIn = false;
+bool openCurrentFadeOut = false;
+uint32_t openCurrentFadeStartedUs = 0;
+float openCurrentFadeStartScale = 0.0f;
+
+uint32_t loopGapWindowMaxUs = 0;
+
+uint32_t controlTimestampUs = 0;
+uint32_t startWaitingAtMs = 0;
+uint32_t overCurrentAtMs = 0;
+uint32_t invalidHallAtMs = 0;
+static constexpr uint32_t START_QUIET_US = 500000;
+static constexpr uint32_t START_WAIT_LIMIT_MS = 10000;
+static constexpr uint32_t LOOP_GAP_LIMIT_US = 10000;
+static constexpr uint32_t OVERCURRENT_HOLD_MS = 20;
+
+// Safety watchdog runtime state. Faults are latched: once a stall/overload is
+// detected the driver is disabled immediately. Bounded recovery retries
+// STALL/OVERLOAD; all other faults require explicit clear.
+bool safetyFaultLatched = false;
+RetryPolicy retryPolicy;
+bool hallWatchdogEnabled = false;
+uint32_t motorEnabledAtMs = 0;
+uint32_t lastHallCount = 0;
+uint32_t lastHallActivityMs = 0;
+uint32_t overloadStartedMs = 0;
+uint32_t lastSafetyCheckMs = 0;
+float safetyHallRpm = 0.0f;
+
+char faultText[96] = "";
+
+uint32_t scheduledRestartAtMs = 0;
+
+// ============================================================================
+// 8. HELPERS
+// ============================================================================
+
+static inline float rpmToRad(float rpm) {
+  return rpm * (_2PI / 60.0f);
+}
+
+static inline float radToRpm(float rad_s) {
+  return rad_s * (60.0f / _2PI);
+}
+
+static inline float clampf(float x, float lo, float hi) {
+  if (!isfinite(x)) return lo;
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+void setFault(const char* msg) {
+  strncpy(faultText, msg ? msg : "", sizeof(faultText) - 1);
+  faultText[sizeof(faultText) - 1] = '\0';
+  Serial.print("FAULT: ");
+  Serial.println(faultText);
+}
+
+void clearFault() {
+  faultText[0] = '\0';
+}
+
+void validateConfig(Config& c) {
+  c.version = CONFIG_VERSION;
+  c.mode = (c.mode == HALL_CURRENT_FOC) ? HALL_CURRENT_FOC : OPEN_CURRENT_FOC;
+
+  c.maxRpm = clampf(c.maxRpm, 100.0f, HARD_MAX_RPM);
+  c.minRpm = clampf(c.minRpm, 50.0f, c.maxRpm);
+  c.accelRpmPerSec = clampf(c.accelRpmPerSec, 50.0f, 5000.0f);
+
+  c.currentLimitA = clampf(c.currentLimitA, 0.10f, HARD_MAX_CURRENT_A);
+  c.motorVoltageLimitV = clampf(c.motorVoltageLimitV, 0.50f, HARD_MAX_MOTOR_VOLTAGE_V);
+  c.alignVoltageV = clampf(c.alignVoltageV, 0.20f, HARD_MAX_ALIGN_VOLTAGE_V);
+  if (c.alignVoltageV > c.motorVoltageLimitV) c.alignVoltageV = c.motorVoltageLimitV;
+
+  c.currentP = clampf(c.currentP, 0.01f, 2.0f);
+  c.currentI = clampf(c.currentI, 1.0f, 1000.0f);
+  c.currentTf = clampf(c.currentTf, 0.0005f, 0.020f);
+
+  c.velocityP = clampf(c.velocityP, 0.0001f, 0.100f);
+  c.velocityI = clampf(c.velocityI, 0.0f, 2.0f);
+  c.velocityTf = clampf(c.velocityTf, 0.001f, 0.100f);
+
+  if (!isfinite(c.hallZeroElectric) || c.hallZeroElectric < 0.0f ||
+      c.hallZeroElectric >= _2PI ||
+      (c.hallDirection != -1 && c.hallDirection != 1)) {
+    c.hallCalValid = false;
+    c.hallZeroElectric = 0.0f;
+    c.hallDirection = 1;
+  }
+}
+
+String jsonEscape(const char* s) {
+  String out;
+  if (!s) return out;
+  while (*s) {
+    char ch = *s++;
+    switch (ch) {
+      case '\\': out += "\\\\"; break;
+      case '"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if ((uint8_t)ch >= 0x20) out += ch;
+        break;
+    }
+  }
+  return out;
+}
+
+static inline float smootherstep01(float x) {
+  x = clampf(x, 0.0f, 1.0f);
+  return x*x*x * (x * (x * 6.0f - 15.0f) + 10.0f);
+}
+
+uint32_t sCurveDurationUs(float fromRad, float toRad) {
+  const float deltaRpm = fabsf(radToRpm(toRad - fromRad));
+  if (deltaRpm < 0.01f) return 0;
+  const float seconds = deltaRpm / max(cfg.accelRpmPerSec, 1.0f);
+  return (uint32_t)clampf(seconds * 1000000.0f,
+                          (float)SCURVE_MIN_DURATION_US,
+                          (float)SCURVE_MAX_DURATION_US);
+}
+
+void resetSCurve(float value = 0.0f) {
+  speedCurve.active = false;
+  speedCurve.target = value;
+  speedCurve.startedUs = micros();
+  speedCurve.durationUs = 0;
+  speedCurve.c0 = value;
+  speedCurve.c1 = speedCurve.c2 = speedCurve.c3 = 0.0f;
+  speedCurve.c4 = speedCurve.c5 = 0.0f;
+  rampedRadPerSec = value;
+}
+
+void evaluateSCurve(uint32_t nowUs, float& omega, float& acceleration, float& jerk) {
+  if (!speedCurve.active || speedCurve.durationUs == 0) {
+    omega = speedCurve.target;
+    acceleration = 0.0f;
+    jerk = 0.0f;
+    return;
+  }
+
+  const uint32_t elapsed = nowUs - speedCurve.startedUs;
+  if (elapsed >= speedCurve.durationUs) {
+    omega = speedCurve.target;
+    acceleration = 0.0f;
+    jerk = 0.0f;
+    return;
+  }
+
+  const float x = (float)elapsed / (float)speedCurve.durationUs;
+  const float x2 = x * x;
+  const float x3 = x2 * x;
+  const float x4 = x3 * x;
+  const float x5 = x4 * x;
+
+  omega = speedCurve.c0 + speedCurve.c1*x + speedCurve.c2*x2 +
+          speedCurve.c3*x3 + speedCurve.c4*x4 + speedCurve.c5*x5;
+
+  const float dTau = speedCurve.c1 + 2.0f*speedCurve.c2*x +
+                     3.0f*speedCurve.c3*x2 + 4.0f*speedCurve.c4*x3 +
+                     5.0f*speedCurve.c5*x4;
+  const float d2Tau = 2.0f*speedCurve.c2 + 6.0f*speedCurve.c3*x +
+                      12.0f*speedCurve.c4*x2 + 20.0f*speedCurve.c5*x3;
+  const float T = speedCurve.durationUs * 1e-6f;
+  acceleration = dTau / T;
+  jerk = d2Tau / (T * T);
+}
+
+void retargetSCurve(float target, uint32_t nowUs) {
+  if (!isfinite(target)) target = 0.0f;
+  if (fabsf(target - speedCurve.target) < 0.001f) return;
+
+  float omega = rampedRadPerSec;
+  if (speedCurve.active) {
+    float acceleration = 0.0f, jerk = 0.0f;
+    evaluateSCurve(nowUs, omega, acceleration, jerk);
+    rampedRadPerSec = omega;
+  }
+
+  const uint32_t durationUs = sCurveDurationUs(omega, target);
+  if (!durationUs) {
+    resetSCurve(target);
+    return;
+  }
+
+  // Monotonic quintic smootherstep from the CURRENT speed to the new target.
+  // We intentionally do not preserve acceleration across an asynchronous
+  // retarget. Preserving a positive acceleration while asking for zero/reverse
+  // mathematically forces the trajectory to keep accelerating the wrong way
+  // before braking. Speed itself remains perfectly continuous here.
+  const float d = target - omega;
+  speedCurve.c0 = omega;
+  speedCurve.c1 = 0.0f;
+  speedCurve.c2 = 0.0f;
+  speedCurve.c3 = 10.0f * d;
+  speedCurve.c4 = -15.0f * d;
+  speedCurve.c5 = 6.0f * d;
+  speedCurve.target = target;
+  speedCurve.startedUs = nowUs;
+  speedCurve.durationUs = durationUs;
+  speedCurve.active = true;
+}
+
+void updateSCurve(uint32_t nowUs) {
+  if (!speedCurve.active) {
+    rampedRadPerSec = speedCurve.target;
+    return;
+  }
+
+  const uint32_t elapsed = nowUs - speedCurve.startedUs;
+  if (elapsed >= speedCurve.durationUs) {
+    rampedRadPerSec = speedCurve.target;
+    speedCurve.active = false;
+    return;
+  }
+
+  float acceleration, jerk;
+  evaluateSCurve(nowUs, rampedRadPerSec, acceleration, jerk);
+}
+
+void startOpenCurrentFadeIn(uint32_t nowUs, float fromScale = 0.0f) {
+  if (cfg.mode != OPEN_CURRENT_FOC) return;
+  openCurrentScale = clampf(fromScale, 0.0f, 1.0f);
+  openCurrentFadeStartScale = openCurrentScale;
+  openCurrentFadeStartedUs = nowUs;
+  openCurrentFadeIn = true;
+  openCurrentFadeOut = false;
+}
+
+void startOpenCurrentFadeOut(uint32_t nowUs) {
+  if (cfg.mode != OPEN_CURRENT_FOC || openCurrentFadeOut) return;
+  openCurrentFadeStartScale = clampf(openCurrentScale, 0.0f, 1.0f);
+  openCurrentFadeStartedUs = nowUs;
+  openCurrentFadeIn = false;
+  openCurrentFadeOut = true;
+}
+
+// Returns true once a requested fade-out has reached zero current.
+bool updateOpenCurrentEnvelope(uint32_t nowUs) {
+  if (cfg.mode != OPEN_CURRENT_FOC) {
+    openCurrentScale = 1.0f;
+    openCurrentFadeIn = openCurrentFadeOut = false;
+    motor.current_limit = cfg.currentLimitA;
+    return true;
+  }
+
+  if (openCurrentFadeOut) {
+    const uint32_t elapsed = nowUs - openCurrentFadeStartedUs;
+    const float x = OPEN_CURRENT_FADE_OUT_US ?
+      clampf((float)elapsed / (float)OPEN_CURRENT_FADE_OUT_US, 0.0f, 1.0f) : 1.0f;
+    openCurrentScale = openCurrentFadeStartScale * (1.0f - smootherstep01(x));
+    if (x >= 1.0f) {
+      openCurrentScale = 0.0f;
+      openCurrentFadeOut = false;
+    }
+  } else if (openCurrentFadeIn) {
+    const uint32_t elapsed = nowUs - openCurrentFadeStartedUs;
+    const float x = OPEN_CURRENT_FADE_IN_US ?
+      clampf((float)elapsed / (float)OPEN_CURRENT_FADE_IN_US, 0.0f, 1.0f) : 1.0f;
+    openCurrentScale = openCurrentFadeStartScale +
+      (1.0f - openCurrentFadeStartScale) * smootherstep01(x);
+    if (x >= 1.0f) {
+      openCurrentScale = 1.0f;
+      openCurrentFadeIn = false;
+    }
+  }
+
+  motor.current_limit = cfg.currentLimitA * clampf(openCurrentScale, 0.0f, 1.0f);
+  return !openCurrentFadeOut && openCurrentScale <= 0.0005f;
+}
+
+void resetControlLoops() {
+  motor.PID_velocity.reset();
+  motor.PID_current_q.reset();
+  motor.PID_current_d.reset();
+}
+
+void disableMotorNow() {
+  if (motorEnabled) motor.disable();
+  digitalWrite(PIN_ENABLE, LOW);
+  motorEnabled = false;
+  overloadStartedMs = 0;
+  openCurrentScale = 0.0f;
+  openCurrentFadeIn = false;
+  openCurrentFadeOut = false;
+  // Keep the configured limit as the resting configuration. enableMotorNow()
+  // will start OPEN mode from zero and fade it in before torque is applied.
+  motor.current_limit = cfg.currentLimitA;
+  resetControlLoops();
+}
+
+void resetSafetyWatchdogForStart() {
+  const uint32_t now = millis();
+  motorEnabledAtMs = now;
+  lastHallCount = hallTransitions;
+  lastHallActivityMs = now;
+  overloadStartedMs = 0;
+  lastSafetyCheckMs = 0;
+  safetyHallRpm = 0.0f;
+
+  // OPEN mode is deliberately Hall-independent. Hall is initialized and read
+  // only in HALL_CURRENT_FOC.
+  hallWatchdogEnabled = ENABLE_EXPERIMENTAL_MOTION_SAFETY &&
+                        (cfg.mode == HALL_CURRENT_FOC);
+}
+
+void enableMotorNow() {
+  if (!motorReady || motorEnabled || safetyFaultLatched) return;
+  resetControlLoops();
+  resetSafetyWatchdogForStart();
+  motor.current_sp = 0.0f;
+  motor.target = 0.0f;
+  if (cfg.mode == OPEN_CURRENT_FOC) {
+    openCurrentScale = 0.0f;
+    motor.current_limit = 0.0f;
+    startOpenCurrentFadeIn(micros(), 0.0f);
+  } else {
+    openCurrentScale = 1.0f;
+    motor.current_limit = cfg.currentLimitA;
+    openCurrentFadeIn = openCurrentFadeOut = false;
+  }
+  motor.enable();
+  motorEnabled = true;
+}
+
+void tripSafetyFault(const char* code, const char* reason) {
+  if (!ENABLE_EXPERIMENTAL_MOTION_SAFETY) return;
+  if (safetyFaultLatched) return;
+
+  const float cmdRpm = fabsf(radToRpm(rampedRadPerSec));
+  const float hallRpm = fabsf(safetyHallRpm);
+  const float iq = motorEnabled ? fabsf(motor.current.q) : 0.0f;
+  const uint32_t quietMs = millis() - lastHallActivityMs;
+
+  const bool retryScheduled = retryPolicy.schedule(code, requestedPercent,
+    requestedDirection, hallWatchdogEnabled, millis());
+  safetyFaultLatched = true;
+  requestedPercent = 0.0f;
+  resetSCurve(0.0f);
+  motor.target = 0.0f;
+  disableMotorNow();
+
+  reversalPending = false;
+  reversePauseActive = false;
+  startWaitingAtMs = 0;
+  prefs.putBool("safetytrip", true); // power cycling does not clear a fault
+  snprintf(faultText, sizeof(faultText), "%s: %s", code, reason);
+
+  // One clear event, no Serial flooding.
+  Serial.println();
+  Serial.println("================ SAFETY FAULT ================");
+  Serial.print("Code: "); Serial.println(code);
+  Serial.print("Reason: "); Serial.println(reason);
+  Serial.printf("Commanded: %.0f rpm | Hall: %.0f rpm | Iq: %.3f A\n",
+                cmdRpm, hallRpm, iq);
+  Serial.printf("No Hall transition: %lu ms | Hall transitions: %lu\n",
+                (unsigned long)quietMs, (unsigned long)hallTransitions);
+  if (retryScheduled) {
+    Serial.printf("Driver OFF. Automatic retry %u/%u in 10 seconds; STOP cancels.\n",
+      retryPolicy.attempts + 1, RetryPolicy::maxAttempts);
+  } else {
+    Serial.println("Driver OFF. Manual clear required (hard fault or retries exhausted).");
+  }
+  Serial.println("Manual clear stops retries: GUI Clear fault / Serial clear");
+  Serial.println("==============================================");
+}
+
+void clearSafetyFault() {
+  retryPolicy.reset();
+  if (!safetyFaultLatched) return;
+  requestedPercent = 0.0f;
+  resetSCurve(0.0f);
+  disableMotorNow();
+  if (prefs.putBool("safetytrip", false) == 0) {
+    setFault("NVS: cannot clear persisted fault");
+    return;
+  }
+  safetyFaultLatched = false;
+  reversalPending = reversePauseActive = false;
+  startWaitingAtMs = 0;
+  hallWatchdogEnabled = false;
+  overloadStartedMs = 0;
+  clearFault();
+  Serial.println("[SAFETY] Fault cleared. Motor remains STOPPED.");
+  if (!motorReady) {
+    // Explicit clear after a persisted fault permits initialization on reboot.
+    scheduledRestartAtMs = millis() + 600;
+  }
+}
+
+void serviceAutoRecovery() {
+  if (!ENABLE_EXPERI
