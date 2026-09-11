@@ -1,0 +1,150 @@
+Active, t.iqA, t.idA,
+                t.faultLatched, t.fault);
+  Serial.printf("Uq=%.3fV Ud=%.3fV\n", t.uqV, t.udV);
+}
+
+void handleSerial() {
+  static char buf[48];
+  static size_t n = 0;
+  static bool overflow = false;
+  unsigned budget = 32;
+  while (budget-- && Serial.available()) {
+    char ch = (char)Serial.read();
+    if (ch == '\r') continue;
+    if (ch == '\n') {
+      if (overflow) { n = 0; overflow = false; continue; }
+      buf[n] = 0;
+      n = 0;
+      String s(buf);
+      s.trim();
+      s.toLowerCase();
+      if (s == "?" || s == "status") {
+        printSerialStatus();
+      } else if (s == "stop" || s == "x") {
+        retryPolicy.cancel();
+        requestedPercent = 0.0f;
+        Serial.println("Smooth S-curve stop requested");
+      } else if (s == "kill") {
+        retryPolicy.cancel();
+        requestedPercent = 0.0f;
+        resetSCurve(0.0f);
+        disableMotorNow();
+        Serial.println("KILL: driver disabled immediately");
+      } else if (s == "clear") {
+        clearSafetyFault();
+      } else if (s == "f") {
+        retryPolicy.cancel();
+        requestedDirection = 1;
+        Serial.println("Direction: forward");
+      } else if (s == "r") {
+        retryPolicy.cancel();
+        requestedDirection = -1;
+        Serial.println("Direction: reverse");
+      } else if (s.startsWith("s ")) {
+        float stopValue;
+        if (parseFiniteNumber(s.substring(2).c_str(), stopValue) && stopValue == 0) {
+          retryPolicy.cancel();
+          requestedPercent = 0;
+          continue;
+        }
+        if (safetyFaultLatched) {
+          Serial.println("Safety fault is latched. Use: clear");
+        } else {
+          float value;
+          if (!parseFiniteNumber(s.substring(2).c_str(), value)) continue;
+          requestedPercent = clampf(value, 0.0f, 100.0f);
+          Serial.printf("Speed request: %.0f%%\n", requestedPercent);
+        }
+      } else if (s.length()) {
+        Serial.println("Commands: status | s 0..100 | f | r | stop | kill | clear");
+      }
+    } else if (n < sizeof(buf) - 1) {
+      buf[n++] = ch;
+    } else {
+      overflow = true;
+    }
+  }
+}
+
+// ============================================================================
+// 17. ARDUINO SETUP / LOOP
+// ============================================================================
+
+void setup() {
+  pinMode(PIN_ENABLE, OUTPUT);
+  digitalWrite(PIN_ENABLE, LOW);
+  Serial.setTxBufferSize(1024);
+  Serial.begin(115200);
+  delay(150);
+  Serial.println();
+  Serial.print("=== MaxxFan MKS ESP32 FOC Mega v");
+  Serial.print(FIRMWARE_VERSION);
+  Serial.println(" ===");
+  Serial.println("SimpleFOC 2.4 expected");
+
+  if (!prefs.begin("maxxfan", false)) {
+    Serial.println("FATAL: NVS unavailable; driver disabled");
+    while (true) delay(1000);
+  }
+  loadConfig();
+
+  // One-time repair for v0.3.4/v0.3.5 NOHALL builds that could persist
+  // HALL_CURRENT_FOC as the default mode in NVS. This commissioning build
+  // forces OPEN exactly once, then leaves future GUI mode selections alone.
+  // This is intentionally a safe migration because no Hall sensor is connected
+  // for the present commissioning setup.
+  if (!prefs.getBool("nhfix036", false)) {
+    if (cfg.mode == HALL_CURRENT_FOC) {
+      Serial.println("NVS migration v0.3.6: forcing OPEN_CURRENT_FOC once (old builds could store HALL by default).");
+      cfg.mode = OPEN_CURRENT_FOC;
+      saveConfig();
+    }
+    if (prefs.putBool("nhfix036", true) == 0) {
+      Serial.println("WARNING: could not store v0.3.6 mode-migration marker");
+    }
+  }
+
+  Serial.print("Control mode: ");
+  Serial.println(cfg.mode == HALL_CURRENT_FOC ? "HALL_CURRENT_FOC" : "OPEN_CURRENT_FOC");
+
+  if (!ENABLE_EXPERIMENTAL_MOTION_SAFETY) prefs.putBool("safetytrip", false);
+  const bool persistedFault = ENABLE_EXPERIMENTAL_MOTION_SAFETY &&
+                             prefs.getBool("safetytrip", false);
+  motorReady = setupMotor();
+  if (!motorReady) disableMotorNow();
+  if (persistedFault) {
+    safetyFaultLatched = true;
+    setFault("PREVIOUS_FAULT: inspect hardware, then clear manually");
+  }
+  publishedConfig = cfg;
+
+  setupWiFi();
+  setupWebServer();
+  updateTelemetry();
+
+  Serial.println("GUI recovery AP: MaxxFan-Setup / MaxxFan123");
+  Serial.println("GUI URL: http://192.168.4.1  or  http://maxxfan.local");
+  Serial.println("Open: http://192.168.4.1");
+  Serial.printf("Safety: experimental trips %s; Hall watchdog %s; OPEN mode is Hall-independent\n",
+                ENABLE_EXPERIMENTAL_MOTION_SAFETY ? "ON" : "OFF",
+                (ENABLE_EXPERIMENTAL_MOTION_SAFETY && cfg.mode == HALL_CURRENT_FOC) ? "ON" : "OFF");
+  Serial.println("Serial commands: status | s 0..100 | f | r | stop | kill | clear");
+}
+
+void loop() {
+  // Motor loop first and as frequently as possible.
+  runMotorControl();
+
+  processPendingCommands();
+  updateTelemetry();
+  handleSerial();
+  serviceAutoRecovery();
+
+  if (scheduledRestartAtMs && (int32_t)(millis() - scheduledRestartAtMs) >= 0) {
+    requestedPercent = 0.0f;
+    resetSCurve(0.0f);
+    disableMotorNow();
+    delay(20);
+    ESP.restart();
+  }
+}
