@@ -1,89 +1,42 @@
 /*
   ============================================================================
-  MaxxFan BLDC Controller
-  Firmware : v0.3.7-TEST
-  Board    : MKS ESP32 FOC Mega (single motor)
-  Motor    : StepperOnline 57BYA54-12-01
-  Library  : SimpleFOC 2.4.0
-  Target   : classic ESP32 / Arduino-ESP32
+  MaxxFan BLDC Controller - v0.3.6.3 DECOUPLED-GUI NOHALL
+  Board : MKS ESP32 FOC Mega (single motor)
+  Motor : StepperOnline 57BYA54-12-01
+  Library: SimpleFOC 2.4.0
 
-  CONTROL MODES
-  ---------------------------------------------------------------------------
-  OPEN_CURRENT_FOC
-    MotionControlType::velocity_openloop
-    TorqueControlType::foc_current
+  Control modes:
+    0) OPEN_CURRENT_FOC
+       MotionControlType::velocity_openloop + TorqueControlType::foc_current
+       - physical phase-current feedback
+       - NO Hall initialization or rotor-position feedback
 
-    - Real physical phase-current feedback on GPIO39/GPIO36.
-    - SimpleFOC generates the electrical angle from commanded velocity.
-    - Hall sensors are COMPLETELY UNUSED:
-        no Hall init
-        no Hall GPIO reads
-        no Hall interrupts
-        no Hall RPM
-        no Hall startup check
-        no Hall stall watchdog
-    - d/q current regulation and current limiting remain active.
-    - Rotor position is not measured, so synchronism cannot be guaranteed.
+    1) HALL_CURRENT_FOC
+       MotionControlType::velocity + TorqueControlType::foc_current
+       - physical phase-current feedback
+       - Hall rotor feedback
 
-  HALL_CURRENT_FOC
-    MotionControlType::velocity
-    TorqueControlType::foc_current
+  Important hardware mapping used by the supplied MKS Mega examples:
+    PWM U/V/W  : GPIO 32 / 33 / 25
+    ENABLE     : GPIO 12  <-- confirmed by the user's working Mega setup
+    Hall A/B/C : GPIO 18 / 19 / 15
+    Current A/B: GPIO 39 / 36
+    Shunt      : 0.01 ohm
+    Gain       : 50 V/V
 
-    - Real physical phase-current feedback.
-    - Hall rotor feedback on GPIO18/GPIO19/GPIO15.
-    - Closed-loop velocity + closed-loop d/q current control.
-    - Hall stall/overload safety is deliberately DISABLED in this test build.
-    - Recommended mode for long-duration operation after commissioning.
-
-  HARDWARE MAPPING
-  ---------------------------------------------------------------------------
-    PWM U/V/W    : GPIO 32 / 33 / 25
-    Driver EN    : GPIO 12
-    Hall A/B/C   : GPIO 18 / 19 / 15
-    Current A/B  : GPIO 39 / 36
-    Current shunt: 0.01 ohm
-    Amplifier gain: 50 V/V
-    Motor pole pairs: 2
-    Nominal supply: 12 V
-
-  SAFETY BEHAVIOUR
-  ---------------------------------------------------------------------------
-  - Motor always boots STOPPED.
-  - Driver is disabled at zero command.
-  - Direction reversal disables the bridge and coasts for at least 500 ms.
-  - Hall mode additionally waits until Hall activity is quiet.
-  - The experimental Hall/current/timing safety layer is disabled temporarily.
-    Its code remains below behind ENABLE_EXPERIMENTAL_MOTION_SAFETY.
-  - OPEN mode intentionally has no rotor-stall detector because it has no
-    rotor feedback. Current limiting and over-current supervision remain active.
-
-  WI-FI / GUI
-  ---------------------------------------------------------------------------
-    Recovery AP : MaxxFan-Setup
-    AP password : MaxxFan123
-    URL         : http://192.168.4.1
-    mDNS        : http://maxxfan.local
-    HTTP user   : admin
-    HTTP password = AP password
-
-    Optional home Wi-Fi credentials are stored in ESP32 NVS.
-    Wi-Fi scanning is permitted only while the motor is stopped.
-
-  ADC NOTE
-  ---------------------------------------------------------------------------
-  This firmware deliberately does NOT read VIN through GPIO13 while Wi-Fi is
-  active. GPIO13 is ADC2 on classic ESP32. Physical current feedback uses ADC1
-  pins GPIO39/GPIO36, avoiding the previous Wi-Fi/ADC contention path.
-
-  QUALIFICATION NOTE
-  ---------------------------------------------------------------------------
-  This is the final software architecture for the present hardware. Before
-  unattended real-world deployment it still requires successful target build,
-  current-scale validation, Hall validation, thermal testing and endurance
-  testing on the actual board/motor/fan.
-
-  The .ino is self-contained apart from normal Arduino/ESP32/SimpleFOC/
-  AsyncTCP/ESPAsyncWebServer libraries. No project-local header is required.
+  IMPORTANT:
+  - This sketch deliberately DOES NOT read VIN on GPIO13 while Wi-Fi is active.
+    GPIO13 is ADC2 on classic ESP32 and can conflict with Wi-Fi/ADC use.
+  - No RUN command is restored at boot. Electrical alignment can move the rotor.
+  - Hall calibration is saved after the first successful Hall initFOC().
+  - Current phase alignment is enabled; initialization may move the rotor.
+  - GUI telemetry transmission is intentionally suspended while PWM is active.
+  - GUI control commands are coalesced and applied after an 80 ms network-quiet window.
+  - In OPEN mode, direction reversal is one continuous signed S-curve; EN stays ON.
+    This restores the timing behavior of the known-smooth v0.3.7 reference: the
+    browser can still command the fan, but periodic network traffic is not generated
+    from the motor loop while the motor is running/ramping/reversing.
+  - Final source candidate: hardware behavior must still be verified on your exact board/motor.
   ============================================================================
 */
 
@@ -91,7 +44,6 @@
 #include <math.h>
 #include <stdlib.h>
 #include <errno.h>
-#include <string.h>
 #include <SimpleFOC.h>
 #include <WiFi.h>
 #include <Preferences.h>
@@ -99,73 +51,16 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 
-// ============================================================================
-// 1. HARDWARE - CHANGE ONLY IF YOUR BOARD REVISION REQUIRES IT
-// ============================================================================
-
-static constexpr int PIN_PWM_U = 32;
-static constexpr int PIN_PWM_V = 33;
-static constexpr int PIN_PWM_W = 25;
-static constexpr int PIN_ENABLE = 12;
-
-static constexpr int PIN_HALL_A = 18;
-static constexpr int PIN_HALL_B = 19;
-static constexpr int PIN_HALL_C = 15;
-
-static constexpr int PIN_CURRENT_A = 39;
-static constexpr int PIN_CURRENT_B = 36;
-
-static constexpr int MOTOR_POLE_PAIRS = 2;
-
-static constexpr float SUPPLY_VOLTAGE_V = 12.0f;
-static constexpr float CURRENT_SHUNT_OHM = 0.01f;
-static constexpr float CURRENT_AMP_GAIN = 50.0f;
-
-// Validate phase correspondence at initFOC rather than assuming board wiring.
-// Alignment applies phase voltage and can move the rotor at boot.
-// Never skip based only on an example for a different board revision.
-static constexpr bool SKIP_CURRENT_SENSE_ALIGNMENT = false;
+// Forward declarations for Arduino's .ino auto-prototype generator.
+// Without these, Arduino can emit prototypes using these custom types
+// before their full struct definitions, causing e.g.:
+//   'Telemetry' does not name a type
+struct Config;
+struct Telemetry;
 
 // ============================================================================
-// 2. ABSOLUTE SAFETY CEILINGS
-//    GUI / NVS values are clamped below these values.
-//    Default motor voltage is 3 V for commissioning. After hardware
-//    validation the GUI may be raised up to the 6 V SinePWM half-bus ceiling.
+// Local retry policy (kept in this .ino: no extra header/library required)
 // ============================================================================
-
-static constexpr float HARD_MAX_CURRENT_A = 2.0f;
-static constexpr float HARD_MAX_MOTOR_VOLTAGE_V = 6.0f;
-static constexpr float HARD_DRIVER_VOLTAGE_LIMIT_V = SUPPLY_VOLTAGE_V;
-static constexpr float HARD_MAX_RPM = 3000.0f;
-static constexpr float HARD_MAX_ALIGN_VOLTAGE_V = 1.2f;
-
-// STOP releases the driver; physical coast-down is observed before restarting.
-
-
-static constexpr float STALL_MIN_COMMAND_RPM = 35.0f;
-static constexpr uint32_t STALL_STARTUP_GRACE_MS = 1800;
-static constexpr uint32_t STALL_NO_HALL_TIMEOUT_MS = 800;
-static constexpr float OVERLOAD_MIN_SPEED_RATIO = 0.35f;
-static constexpr float OVERLOAD_CURRENT_RATIO = 0.75f;
-static constexpr uint32_t OVERLOAD_HOLD_MS = 1500;
-static constexpr uint32_t SAFETY_CHECK_PERIOD_MS = 20;
-
-// Temporary commissioning switch requested by the user.
-// false: no WINDMILL / STALL / OVERLOAD / Hall-invalid / timing / software-
-// current safety trip, no automatic retry and no stored safety fault.
-// true: re-enables the experimental safety layer after it has been validated
-// with the actual Hall wiring and fan mechanics.
-static constexpr bool ENABLE_EXPERIMENTAL_MOTION_SAFETY = false;
-
-
-// ============================================================================
-// BOUNDED AUTOMATIC RECOVERY - HALL MODE ONLY
-// ============================================================================
-//
-// Only Hall-mode STALL and OVERLOAD faults are eligible for automatic retry.
-// OPEN_CURRENT_FOC cannot diagnose rotor stall reliably because it intentionally
-// has no rotor feedback.
-//
 struct RetryPolicy {
   static constexpr uint32_t cooldownMs = 10000;
   static constexpr uint8_t maxAttempts = 3;
@@ -193,16 +88,10 @@ struct RetryPolicy {
   bool schedule(const char* code, float request, int8_t dir,
                 bool hallAvailable, uint32_t now) {
     cancel();
-
-    const bool recoverable =
-      code &&
-      (strcmp(code, "STALL") == 0 || strcmp(code, "OVERLOAD") == 0);
-
-    if (!recoverable || !hallAvailable || request <= 0.0f ||
-        attempts >= maxAttempts) {
+    if (!code || (strcmp(code, "STALL") && strcmp(code, "OVERLOAD")) ||
+        !hallAvailable || request <= 0.0f || attempts >= maxAttempts) {
       return false;
     }
-
     percent = request;
     direction = dir;
     scheduledAt = now;
@@ -231,17 +120,101 @@ struct RetryPolicy {
       trackingHealthy = false;
       return;
     }
-
     if (!trackingHealthy) {
       trackingHealthy = true;
       healthyAt = now;
     }
-
     if (now - healthyAt >= healthyResetMs) {
       attempts = 0;
     }
   }
 };
+
+// ============================================================================
+// 1. HARDWARE - CHANGE ONLY IF YOUR BOARD REVISION REQUIRES IT
+// ============================================================================
+
+static constexpr int PIN_PWM_U = 32;
+static constexpr int PIN_PWM_V = 33;
+static constexpr int PIN_PWM_W = 25;
+static constexpr int PIN_ENABLE = 12;
+
+static constexpr int PIN_HALL_A = 18;
+static constexpr int PIN_HALL_B = 19;
+static constexpr int PIN_HALL_C = 15;
+
+static constexpr int PIN_CURRENT_A = 39;
+static constexpr int PIN_CURRENT_B = 36;
+
+static constexpr int MOTOR_POLE_PAIRS = 2;
+
+// 57BYA54-12-01 datasheet values
+static constexpr float MOTOR_PHASE_RESISTANCE_OHM = 0.27f;
+static constexpr float MOTOR_PHASE_INDUCTANCE_H = 0.00057f;
+
+static constexpr float SUPPLY_VOLTAGE_V = 12.0f;
+static constexpr float CURRENT_SHUNT_OHM = 0.01f;
+static constexpr float CURRENT_AMP_GAIN = 50.0f;
+
+// Validate phase correspondence at initFOC rather than assuming board wiring.
+// Alignment applies phase voltage and can move the rotor at boot.
+// Never skip based only on an example for a different board revision.
+static constexpr bool SKIP_CURRENT_SENSE_ALIGNMENT = false;
+
+// ============================================================================
+// 2. ABSOLUTE SAFETY CEILINGS
+//    GUI / NVS values are clamped below these values.
+//    Driver uses full bus for PWM centering. Each d/q voltage is <=3 V;
+//    vector magnitude <=sqrt(2)*3 V, below the 6 V half-bus at nominal 12 V.
+// ============================================================================
+
+static constexpr float HARD_MAX_CURRENT_A = 2.0f;
+static constexpr float HARD_MAX_MOTOR_VOLTAGE_V = 3.0f;
+static constexpr float HARD_DRIVER_VOLTAGE_LIMIT_V = SUPPLY_VOLTAGE_V;
+static constexpr float HARD_MAX_RPM = 3000.0f;
+static constexpr float HARD_MAX_ALIGN_VOLTAGE_V = 1.2f;
+
+// STOP releases the driver; physical coast-down is observed before restarting.
+
+// Normal speed changes, STOP and reversal use a monotonic quintic S-curve.
+// cfg.accelRpmPerSec is kept internally for NVS compatibility; the GUI exposes
+// the equivalent full 0->100% ramp time because it is easier to tune.
+static constexpr uint32_t SCURVE_MIN_DURATION_US = 250000;  // 250 ms for tiny changes
+static constexpr uint32_t SCURVE_MAX_DURATION_US = 8000000; // sanity ceiling
+static constexpr float SCURVE_ZERO_EPS_RAD_S = 0.05f;
+static constexpr uint32_t OPEN_REVERSE_PAUSE_MS = 350;
+
+// OPEN + foc_current has a subtle property in SimpleFOC: velocityOpenloop()
+// returns current_limit even at 0 rad/s. Therefore cutting EN exactly at zero
+// can release a still-energised stator field and make an audible click. Fade the
+// current setpoint smoothly before disabling, and fade it in after enabling.
+static constexpr uint32_t OPEN_CURRENT_FADE_IN_US = 180000;
+static constexpr uint32_t OPEN_CURRENT_FADE_OUT_US = 140000;
+
+// GUI commands are received by AsyncTCP/WebServer on an asynchronous network
+// task.  Do not retarget the motor in the same burst that parses and ACKs the
+// HTTP request.  Keep only the newest GUI command and apply it after this short
+// network-quiet window.  Serial commands remain immediate.
+static constexpr uint32_t GUI_COMMAND_QUIET_MS = 80;
+
+
+// Independent stall / overload watchdog.
+// HALL mode uses Hall motion for stall/overload supervision. OPEN mode is
+// deliberately Hall-independent: no Hall init, no Hall telemetry, no Hall watchdog.
+static constexpr bool USE_HALL_WATCHDOG_IN_OPEN_LOOP = false;
+static constexpr float STALL_MIN_COMMAND_RPM = 35.0f;
+static constexpr uint32_t STALL_STARTUP_GRACE_MS = 1800;
+static constexpr uint32_t STALL_NO_HALL_TIMEOUT_MS = 800;
+static constexpr float OVERLOAD_MIN_SPEED_RATIO = 0.35f;
+static constexpr float OVERLOAD_CURRENT_RATIO = 0.75f;
+static constexpr uint32_t OVERLOAD_HOLD_MS = 1500;
+static constexpr uint32_t SAFETY_CHECK_PERIOD_MS = 20;
+
+// Commissioning compatibility with the known-good v0.3.7 behavior.
+// Keep the diagnostic code compiled in, but do not let experimental
+// WINDMILL / STALL / OVERLOAD / LOOP_GAP / software over-current trips
+// block OPEN_CURRENT_FOC while Hall is not connected.
+static constexpr bool ENABLE_EXPERIMENTAL_MOTION_SAFETY = false;
 
 // ============================================================================
 // 3. WI-FI
@@ -250,7 +223,7 @@ struct RetryPolicy {
 static const char* AP_SSID = "MaxxFan-Setup";
 static const char* AP_PASSWORD = "MaxxFan123";   // >= 8 characters
 
-static constexpr const char* FIRMWARE_VERSION = "0.3.8-GUI-SAFE-TEST";
+static constexpr const char* FIRMWARE_VERSION = "0.3.6.3-DECOUPLED-GUI-NOHALL";
 
 // AP is always enabled, so 192.168.4.1 remains a recovery path.
 // Optional home Wi-Fi credentials are entered in the GUI and stored in NVS.
@@ -298,7 +271,8 @@ Config makeDefaultConfig() {
   c.version = CONFIG_VERSION;
   c.mode = OPEN_CURRENT_FOC;
 
-  // Conservative first-test limits.
+  // Conservative first-test limits. OPEN is the safe/default commissioning mode.
+  // Hall is enabled only after explicitly selecting HALL_CURRENT_FOC. 
   c.maxRpm = 600.0f;
   c.minRpm = 120.0f;
   c.accelRpmPerSec = 350.0f;
@@ -397,12 +371,16 @@ struct Telemetry {
   bool measuredRpmValid;
   float iqA;
   float idA;
+  float uqV;
+  float udV;
   float currentLimitA;
   float voltageLimitV;
   uint32_t hallTransitions;
   float hallRpm;
   bool hallWatchdogEnabled;
   uint32_t hallQuietMs;
+  uint32_t loopGapUs;
+  bool sCurveActive;
   bool faultLatched;
   bool retryPending;
   uint8_t retryAttempts;
@@ -428,6 +406,7 @@ struct PendingControl {
   bool valid;
   float percent;
   int8_t direction;
+  uint32_t receivedAtMs;
 };
 PendingControl pendingControl{};
 
@@ -463,13 +442,35 @@ float requestedPercent = 0.0f;
 int8_t requestedDirection = 1;
 int8_t driveDirection = 1;
 float rampedRadPerSec = 0.0f;
+
+struct SCurveState {
+  bool active = false;
+  float target = 0.0f;
+  uint32_t startedUs = 0;
+  uint32_t durationUs = 0;
+  // omega(tau) = c0 + c1*tau + ... + c5*tau^5, tau in [0,1].
+  // Every retarget starts from the CURRENT commanded speed and uses the classic
+  // 6x^5-15x^4+10x^3 smootherstep shape. This guarantees a monotonic command
+  // and avoids the old mid-ramp reversal overshoot caused by preserving an
+  // acceleration that was pointing away from the new target.
+  float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f, c4 = 0.0f, c5 = 0.0f;
+};
+SCurveState speedCurve;
+
+float openCurrentScale = 0.0f;
+bool openCurrentFadeIn = false;
+bool openCurrentFadeOut = false;
+uint32_t openCurrentFadeStartedUs = 0;
+float openCurrentFadeStartScale = 0.0f;
+
+uint32_t loopGapWindowMaxUs = 0;
+
 uint32_t controlTimestampUs = 0;
 uint32_t startWaitingAtMs = 0;
 uint32_t overCurrentAtMs = 0;
 uint32_t invalidHallAtMs = 0;
 static constexpr uint32_t START_QUIET_US = 500000;
 static constexpr uint32_t START_WAIT_LIMIT_MS = 10000;
-static constexpr uint32_t REVERSE_COAST_MS = 500;
 static constexpr uint32_t LOOP_GAP_LIMIT_US = 10000;
 static constexpr uint32_t OVERCURRENT_HOLD_MS = 20;
 
@@ -569,10 +570,167 @@ String jsonEscape(const char* s) {
   return out;
 }
 
-float rampToward(float value, float target, float maxStep) {
-  if (value < target) return min(value + maxStep, target);
-  if (value > target) return max(value - maxStep, target);
-  return value;
+static inline float smootherstep01(float x) {
+  x = clampf(x, 0.0f, 1.0f);
+  return x*x*x * (x * (x * 6.0f - 15.0f) + 10.0f);
+}
+
+uint32_t sCurveDurationUs(float fromRad, float toRad) {
+  const float deltaRpm = fabsf(radToRpm(toRad - fromRad));
+  if (deltaRpm < 0.01f) return 0;
+  const float seconds = deltaRpm / max(cfg.accelRpmPerSec, 1.0f);
+  return (uint32_t)clampf(seconds * 1000000.0f,
+                          (float)SCURVE_MIN_DURATION_US,
+                          (float)SCURVE_MAX_DURATION_US);
+}
+
+void resetSCurve(float value = 0.0f) {
+  speedCurve.active = false;
+  speedCurve.target = value;
+  speedCurve.startedUs = micros();
+  speedCurve.durationUs = 0;
+  speedCurve.c0 = value;
+  speedCurve.c1 = speedCurve.c2 = speedCurve.c3 = 0.0f;
+  speedCurve.c4 = speedCurve.c5 = 0.0f;
+  rampedRadPerSec = value;
+}
+
+void evaluateSCurve(uint32_t nowUs, float& omega, float& acceleration, float& jerk) {
+  if (!speedCurve.active || speedCurve.durationUs == 0) {
+    omega = speedCurve.target;
+    acceleration = 0.0f;
+    jerk = 0.0f;
+    return;
+  }
+
+  const uint32_t elapsed = nowUs - speedCurve.startedUs;
+  if (elapsed >= speedCurve.durationUs) {
+    omega = speedCurve.target;
+    acceleration = 0.0f;
+    jerk = 0.0f;
+    return;
+  }
+
+  const float x = (float)elapsed / (float)speedCurve.durationUs;
+  const float x2 = x * x;
+  const float x3 = x2 * x;
+  const float x4 = x3 * x;
+  const float x5 = x4 * x;
+
+  omega = speedCurve.c0 + speedCurve.c1*x + speedCurve.c2*x2 +
+          speedCurve.c3*x3 + speedCurve.c4*x4 + speedCurve.c5*x5;
+
+  const float dTau = speedCurve.c1 + 2.0f*speedCurve.c2*x +
+                     3.0f*speedCurve.c3*x2 + 4.0f*speedCurve.c4*x3 +
+                     5.0f*speedCurve.c5*x4;
+  const float d2Tau = 2.0f*speedCurve.c2 + 6.0f*speedCurve.c3*x +
+                      12.0f*speedCurve.c4*x2 + 20.0f*speedCurve.c5*x3;
+  const float T = speedCurve.durationUs * 1e-6f;
+  acceleration = dTau / T;
+  jerk = d2Tau / (T * T);
+}
+
+void retargetSCurve(float target, uint32_t nowUs) {
+  if (!isfinite(target)) target = 0.0f;
+  if (fabsf(target - speedCurve.target) < 0.001f) return;
+
+  float omega = rampedRadPerSec;
+  if (speedCurve.active) {
+    float acceleration = 0.0f, jerk = 0.0f;
+    evaluateSCurve(nowUs, omega, acceleration, jerk);
+    rampedRadPerSec = omega;
+  }
+
+  const uint32_t durationUs = sCurveDurationUs(omega, target);
+  if (!durationUs) {
+    resetSCurve(target);
+    return;
+  }
+
+  // Monotonic quintic smootherstep from the CURRENT speed to the new target.
+  // We intentionally do not preserve acceleration across an asynchronous
+  // retarget. Preserving a positive acceleration while asking for zero/reverse
+  // mathematically forces the trajectory to keep accelerating the wrong way
+  // before braking. Speed itself remains perfectly continuous here.
+  const float d = target - omega;
+  speedCurve.c0 = omega;
+  speedCurve.c1 = 0.0f;
+  speedCurve.c2 = 0.0f;
+  speedCurve.c3 = 10.0f * d;
+  speedCurve.c4 = -15.0f * d;
+  speedCurve.c5 = 6.0f * d;
+  speedCurve.target = target;
+  speedCurve.startedUs = nowUs;
+  speedCurve.durationUs = durationUs;
+  speedCurve.active = true;
+}
+
+void updateSCurve(uint32_t nowUs) {
+  if (!speedCurve.active) {
+    rampedRadPerSec = speedCurve.target;
+    return;
+  }
+
+  const uint32_t elapsed = nowUs - speedCurve.startedUs;
+  if (elapsed >= speedCurve.durationUs) {
+    rampedRadPerSec = speedCurve.target;
+    speedCurve.active = false;
+    return;
+  }
+
+  float acceleration, jerk;
+  evaluateSCurve(nowUs, rampedRadPerSec, acceleration, jerk);
+}
+
+void startOpenCurrentFadeIn(uint32_t nowUs, float fromScale = 0.0f) {
+  if (cfg.mode != OPEN_CURRENT_FOC) return;
+  openCurrentScale = clampf(fromScale, 0.0f, 1.0f);
+  openCurrentFadeStartScale = openCurrentScale;
+  openCurrentFadeStartedUs = nowUs;
+  openCurrentFadeIn = true;
+  openCurrentFadeOut = false;
+}
+
+void startOpenCurrentFadeOut(uint32_t nowUs) {
+  if (cfg.mode != OPEN_CURRENT_FOC || openCurrentFadeOut) return;
+  openCurrentFadeStartScale = clampf(openCurrentScale, 0.0f, 1.0f);
+  openCurrentFadeStartedUs = nowUs;
+  openCurrentFadeIn = false;
+  openCurrentFadeOut = true;
+}
+
+// Returns true once a requested fade-out has reached zero current.
+bool updateOpenCurrentEnvelope(uint32_t nowUs) {
+  if (cfg.mode != OPEN_CURRENT_FOC) {
+    openCurrentScale = 1.0f;
+    openCurrentFadeIn = openCurrentFadeOut = false;
+    motor.current_limit = cfg.currentLimitA;
+    return true;
+  }
+
+  if (openCurrentFadeOut) {
+    const uint32_t elapsed = nowUs - openCurrentFadeStartedUs;
+    const float x = OPEN_CURRENT_FADE_OUT_US ?
+      clampf((float)elapsed / (float)OPEN_CURRENT_FADE_OUT_US, 0.0f, 1.0f) : 1.0f;
+    openCurrentScale = openCurrentFadeStartScale * (1.0f - smootherstep01(x));
+    if (x >= 1.0f) {
+      openCurrentScale = 0.0f;
+      openCurrentFadeOut = false;
+    }
+  } else if (openCurrentFadeIn) {
+    const uint32_t elapsed = nowUs - openCurrentFadeStartedUs;
+    const float x = OPEN_CURRENT_FADE_IN_US ?
+      clampf((float)elapsed / (float)OPEN_CURRENT_FADE_IN_US, 0.0f, 1.0f) : 1.0f;
+    openCurrentScale = openCurrentFadeStartScale +
+      (1.0f - openCurrentFadeStartScale) * smootherstep01(x);
+    if (x >= 1.0f) {
+      openCurrentScale = 1.0f;
+      openCurrentFadeIn = false;
+    }
+  }
+
+  motor.current_limit = cfg.currentLimitA * clampf(openCurrentScale, 0.0f, 1.0f);
+  return !openCurrentFadeOut && openCurrentScale <= 0.0005f;
 }
 
 void resetControlLoops() {
@@ -586,6 +744,12 @@ void disableMotorNow() {
   digitalWrite(PIN_ENABLE, LOW);
   motorEnabled = false;
   overloadStartedMs = 0;
+  openCurrentScale = 0.0f;
+  openCurrentFadeIn = false;
+  openCurrentFadeOut = false;
+  // Keep the configured limit as the resting configuration. enableMotorNow()
+  // will start OPEN mode from zero and fade it in before torque is applied.
+  motor.current_limit = cfg.currentLimitA;
   resetControlLoops();
 }
 
@@ -598,8 +762,8 @@ void resetSafetyWatchdogForStart() {
   lastSafetyCheckMs = 0;
   safetyHallRpm = 0.0f;
 
-  // Hall watchdog exists only in HALL_CURRENT_FOC.
-  // OPEN_CURRENT_FOC is intentionally completely Hall-independent.
+  // OPEN mode is deliberately Hall-independent. Hall is initialized and read
+  // only in HALL_CURRENT_FOC.
   hallWatchdogEnabled = ENABLE_EXPERIMENTAL_MOTION_SAFETY &&
                         (cfg.mode == HALL_CURRENT_FOC);
 }
@@ -610,6 +774,15 @@ void enableMotorNow() {
   resetSafetyWatchdogForStart();
   motor.current_sp = 0.0f;
   motor.target = 0.0f;
+  if (cfg.mode == OPEN_CURRENT_FOC) {
+    openCurrentScale = 0.0f;
+    motor.current_limit = 0.0f;
+    startOpenCurrentFadeIn(micros(), 0.0f);
+  } else {
+    openCurrentScale = 1.0f;
+    motor.current_limit = cfg.currentLimitA;
+    openCurrentFadeIn = openCurrentFadeOut = false;
+  }
   motor.enable();
   motorEnabled = true;
 }
@@ -624,10 +797,10 @@ void tripSafetyFault(const char* code, const char* reason) {
   const uint32_t quietMs = millis() - lastHallActivityMs;
 
   const bool retryScheduled = retryPolicy.schedule(code, requestedPercent,
-    requestedDirection, cfg.mode == HALL_CURRENT_FOC, millis());
+    requestedDirection, hallWatchdogEnabled, millis());
   safetyFaultLatched = true;
   requestedPercent = 0.0f;
-  rampedRadPerSec = 0.0f;
+  resetSCurve(0.0f);
   motor.target = 0.0f;
   disableMotorNow();
 
@@ -660,7 +833,7 @@ void clearSafetyFault() {
   retryPolicy.reset();
   if (!safetyFaultLatched) return;
   requestedPercent = 0.0f;
-  rampedRadPerSec = 0.0f;
+  resetSCurve(0.0f);
   disableMotorNow();
   if (prefs.putBool("safetytrip", false) == 0) {
     setFault("NVS: cannot clear persisted fault");
@@ -711,7 +884,7 @@ void serviceAutoRecovery() {
   retryPolicy.launched();
   safetyFaultLatched = false;
   clearFault();
-  rampedRadPerSec = 0.0f;
+  resetSCurve(0.0f);
   motor.target = motor.current_sp = 0.0f;
   startWaitingAtMs = 0;
   reversalPending = reversePauseActive = false;
@@ -734,35 +907,26 @@ void saveConfig() {
 }
 
 void loadConfig() {
-  // Preferred format: one configuration blob.
+  // NVS migration strategy:
+  // - NEVER discard existing settings just because CONFIG_VERSION changed.
+  // - Existing keys are loaded as-is.
+  // - Any newly introduced/missing key automatically receives its current
+  //   default value.
+  // - After validation, the config is written back with the current version.
   //
-  // If the stored blob has the same struct size, load it even if its version
-  // differs. validateConfig() applies current safe bounds and the blob is then
-  // rewritten with CONFIG_VERSION. This prevents ordinary firmware upgrades
-  // from losing valid tuning solely because the schema version changed.
-  //
-  // If no compatible blob exists, import the legacy individual NVS keys once.
-  const size_t blobLength = prefs.getBytesLength("config6");
-
-  if (blobLength == sizeof(Config)) {
+  // This means a normal firmware update preserves tuning, Hall calibration,
+  // mode and limits. Wi-Fi credentials use separate NVS keys and are also kept.
+  if (prefs.getBytesLength("config6") == sizeof(Config)) {
     Config saved{};
-
-    if (prefs.getBytes("config6", &saved, sizeof(saved)) == sizeof(saved)) {
-      const uint32_t oldVersion = saved.version;
+    if (prefs.getBytes("config6", &saved, sizeof(saved)) == sizeof(saved) &&
+        saved.version == CONFIG_VERSION) {
       cfg = saved;
       validateConfig(cfg);
-
-      if (oldVersion != CONFIG_VERSION) {
-        Serial.printf("NVS blob migration: %lu -> %lu\n",
-                      (unsigned long)oldVersion,
-                      (unsigned long)CONFIG_VERSION);
-        saveConfig();
-      }
       return;
     }
   }
-
   const Config d = makeDefaultConfig();
+  const uint32_t storedVersion = prefs.getUInt("cfgver", 0);
 
   cfg.version = CONFIG_VERSION;
   cfg.mode = prefs.getUChar("mode", d.mode);
@@ -784,8 +948,14 @@ void loadConfig() {
   cfg.hallDirection = prefs.getChar("hdir", d.hallDirection);
 
   validateConfig(cfg);
-  Serial.println("NVS: imported legacy/default configuration.");
-  saveConfig();
+
+  if (storedVersion != CONFIG_VERSION) {
+    Serial.print("NVS config migration: ");
+    Serial.print(storedVersion);
+    Serial.print(" -> ");
+    Serial.println(CONFIG_VERSION);
+    saveConfig();
+  }
 }
 
 // ============================================================================
@@ -813,7 +983,7 @@ void applyRuntimeConfig() {
   motor.PID_velocity.D = 0.0f;
   motor.LPF_velocity.Tf = cfg.velocityTf;
 
-  // Hall runtime configuration is touched only in Hall mode.
+  // Do not touch Hall runtime state in OPEN commissioning mode.
   if (cfg.mode == HALL_CURRENT_FOC) {
     hall.velocity_max = max(rpmToRad(cfg.maxRpm) * 1.7f, 150.0f);
   }
@@ -828,15 +998,19 @@ bool setupMotor() {
     return false;
   }
 
-  // Hold all driver inputs inactive until SimpleFOC configures PWM.
+  // Exact pre-driver state used by the known-good no-Hall v0.3.7 path.
+  // The bridge remains disabled through PIN_ENABLE, while all PWM inputs are
+  // held LOW until SimpleFOC configures the PWM hardware.
   pinMode(PIN_PWM_U, OUTPUT);
   pinMode(PIN_PWM_V, OUTPUT);
   pinMode(PIN_PWM_W, OUTPUT);
   digitalWrite(PIN_PWM_U, LOW);
   digitalWrite(PIN_PWM_V, LOW);
   digitalWrite(PIN_PWM_W, LOW);
-  // Torque control uses physical inline phase-current feedback.
-  // No estimated-current/model-based torque controller is used.
+
+  // Motor parameters used by SimpleFOC 2.4 current-control compensation.
+  // Do not enable model compensation with unverified phase/line parameters.
+  // Current PI runs directly on measured phase currents.
 
 
   // Explicitly initialise v2.4 feed-forward state. Global objects are normally
@@ -847,8 +1021,9 @@ bool setupMotor() {
   motor.feed_forward_voltage.d = 0.0f;
   motor.feed_forward_velocity = 0.0f;
 
-  // TRUE HALL-INDEPENDENT OPEN LOOP:
-  // Do not even initialise or read Hall GPIOs unless HALL_CURRENT_FOC is active.
+  // Hall is intentionally absent from OPEN_CURRENT_FOC: no init, interrupts,
+  // startup gate, telemetry or watchdog dependency. This makes OPEN mode a real
+  // Hall-free test mode. HALL mode keeps the full sensor path.
   if (cfg.mode == HALL_CURRENT_FOC) {
     hall.pullup = Pullup::USE_EXTERN;
     hall.velocity_max = max(rpmToRad(cfg.maxRpm) * 1.7f, 150.0f);
@@ -858,12 +1033,12 @@ bool setupMotor() {
     hall.enableInterrupts(doHallA, doHallB, doHallC);
     motor.linkSensor(&hall);
 
-    // Reserved for a future safety pass. Do not block current commissioning
-    // on a noisy/moving Hall input.
+    // Keep the Hall safety gate available for later qualification, but do not
+    // let it participate during current no-Hall commissioning.
     if (ENABLE_EXPERIMENTAL_MOTION_SAFETY) {
       const uint32_t waitStart = millis();
       while (hallQuietUs() < START_QUIET_US) {
-        if (millis() - waitStart >= START_WAIT_LIMIT_MS) { {
+        if (millis() - waitStart >= START_WAIT_LIMIT_MS) {
           setFault("WINDMILL: cannot initialize Hall FOC while rotor is moving");
           return false;
         }
@@ -943,8 +1118,17 @@ bool setupMotor() {
     Serial.println("Using saved Hall FOC calibration.");
   }
 
+  Serial.printf("initFOC: mode=%s, Hall=%s, currentSense=GPIO%d/GPIO%d, align=%.2f V, skipCurrentAlign=%s\n",
+                cfg.mode == OPEN_CURRENT_FOC ? "OPEN_CURRENT_FOC" : "HALL_CURRENT_FOC",
+                cfg.mode == OPEN_CURRENT_FOC ? "UNUSED" : "ACTIVE",
+                PIN_CURRENT_A, PIN_CURRENT_B, cfg.alignVoltageV,
+                SKIP_CURRENT_SENSE_ALIGNMENT ? "true" : "false");
+
   if (!motor.initFOC()) {
-    setFault("initFOC failed - check phases/Hall/current sense");
+    if (cfg.mode == OPEN_CURRENT_FOC)
+      setFault("OPEN initFOC failed - current-sense alignment failed (Hall unused)");
+    else
+      setFault("HALL initFOC failed - check Hall/current-sense alignment");
     motor.disable();
     return false;
   }
@@ -969,7 +1153,7 @@ bool setupMotor() {
   requestedPercent = 0.0f;
   requestedDirection = cfg.defaultReverse ? -1 : 1;
   driveDirection = requestedDirection;
-  rampedRadPerSec = 0.0f;
+  resetSCurve(0.0f);
   motor.target = 0.0f;
   motor.disable();
   motorEnabled = false;
@@ -986,28 +1170,20 @@ bool setupMotor() {
 void runSafetyMonitor() {
   if (!ENABLE_EXPERIMENTAL_MOTION_SAFETY) return;
   if (!motorReady || !motorEnabled || safetyFaultLatched) return;
+  if (!hallWatchdogEnabled) return; // OPEN mode has no Hall dependency.
 
   const uint32_t now = millis();
   if (now - lastSafetyCheckMs < SAFETY_CHECK_PERIOD_MS) return;
   lastSafetyCheckMs = now;
-
-  // Hall-based stall/overload monitoring exists only in Hall mode.
-  // OPEN_CURRENT_FOC must never read or update the Hall sensor.
-  if (cfg.mode != HALL_CURRENT_FOC) {
-    hallWatchdogEnabled = false;
-    overloadStartedMs = 0;
-    return;
-  }
 
   const uint32_t hc = hallTransitions;
   if (hc != lastHallCount) {
     lastHallCount = hc;
     lastHallActivityMs = now;
   }
-
   safetyHallRpm = fabsf(radToRpm(hall.getVelocity()));
 
-  // STOP/reversal release the driver; do not diagnose coast-down as overload.
+  // Do not diagnose commanded deceleration/reversal as a stall/overload.
   if (requestedPercent <= 0.01f || reversalPending || reversePauseActive) {
     overloadStartedMs = 0;
     return;
@@ -1025,22 +1201,12 @@ void runSafetyMonitor() {
     return;
   }
 
-  if (!hallWatchdogEnabled) {
-    overloadStartedMs = 0;
-    return;
-  }
-
-  // Level 1: hard stall / missing Hall motion. The timeout is deliberately
-  // far longer than normal Hall-sector timing, rejecting brief gusts/RPM ripple.
   const uint32_t quietMs = now - lastHallActivityMs;
   if (quietMs >= STALL_NO_HALL_TIMEOUT_MS) {
     tripSafetyFault("STALL", "no Hall motion while torque is commanded");
     return;
   }
 
-  // Level 2: mechanical overload. Require BOTH severe speed loss AND current
-  // near the configured current limit, continuously for OVERLOAD_HOLD_MS.
-  // This rejects short wind gusts and acceleration transients.
   const float speedRatio = (commandRpm > 1.0f) ? safetyHallRpm / commandRpm : 1.0f;
   const float iq = fabsf(motor.current.q);
   const bool overloaded =
@@ -1061,20 +1227,24 @@ void runSafetyMonitor() {
 // Coast before STOP/reverse. Never infer physical standstill from ramped target.
 void runMotorControl() {
   if (!motorReady) return;
+
   if (safetyFaultLatched || scheduledRestartAtMs) {
     requestedPercent = 0.0f;
-    rampedRadPerSec = 0.0f;
+    resetSCurve(0.0f);
     disableMotorNow();
     return;
   }
+
   const uint32_t nowUs = micros();
   const uint32_t elapsedUs = nowUs - controlTimestampUs;
   controlTimestampUs = nowUs;
-  if (ENABLE_EXPERIMENTAL_MOTION_SAFETY && motorEnabled && elapsedUs > LOOP_GAP_LIMIT_US) {
+  if (elapsedUs > loopGapWindowMaxUs) loopGapWindowMaxUs = elapsedUs;
+  if (ENABLE_EXPERIMENTAL_MOTION_SAFETY &&
+      motorEnabled && elapsedUs > LOOP_GAP_LIMIT_US) {
     tripSafetyFault("LOOP_GAP", "motor loop exceeded 10 ms");
     return;
   }
-  const float dt = min(elapsedUs * 1e-6f, 0.01f);
+
   if (cfg.mode == HALL_CURRENT_FOC) {
     hall.update();
     safetyHallRpm = fabsf(radToRpm(hall.getVelocity()));
@@ -1082,84 +1252,120 @@ void runMotorControl() {
     safetyHallRpm = 0.0f;
   }
 
-  if (requestedPercent <= 0.01f) {
-    disableMotorNow();
-    rampedRadPerSec = 0.0f;
-    reversalPending = reversePauseActive = false;
-    startWaitingAtMs = 0;
-    return;
-  }
-  if (motorEnabled && requestedDirection != driveDirection) {
-    // Never reverse an actively driven fan. Release the bridge first.
-    // OPEN mode has no rotor sensor, so it uses a fixed minimum coast period.
-    // HALL mode uses the same minimum period plus a Hall-quiet check.
-    disableMotorNow();
-    rampedRadPerSec = 0.0f;
+  const bool stopRequested = requestedPercent <= 0.01f;
+
+  // OPEN mode: direction is simply the sign of the velocity target.  SimpleFOC
+  // velocity_openloop natively accepts negative velocity.  Keeping the bridge
+  // enabled lets the same S-curve that makes ordinary speed changes clean also
+  // perform +RPM -> -RPM continuously, without an EN OFF/ON click at zero.
+  if (cfg.mode == OPEN_CURRENT_FOC && motorEnabled && !stopRequested &&
+      requestedDirection != driveDirection) {
+    driveDirection = requestedDirection;
     reversalPending = true;
-    reversePauseActive = true;
-    startWaitingAtMs = millis();
+    reversePauseActive = false;
   }
 
+  // Hall mode keeps the conservative stop/coast/restart reversal sequence.
+  bool directionChange = !stopRequested && (requestedDirection != driveDirection);
+
+  // If already disabled, stay stopped or perform the controlled startup gate.
   if (!motorEnabled) {
-    if (!startWaitingAtMs) {
-      startWaitingAtMs = millis();
-    }
-
-    const uint32_t stoppedForMs = millis() - startWaitingAtMs;
-
-    if (reversePauseActive && stoppedForMs < REVERSE_COAST_MS) {
-      reversalPending = true;
+    resetSCurve(0.0f);
+    if (stopRequested) {
+      reversalPending = false;
+      reversePauseActive = false;
+      startWaitingAtMs = 0;
       return;
     }
 
+    if (!startWaitingAtMs) startWaitingAtMs = millis();
+
     if (cfg.mode == HALL_CURRENT_FOC && ENABLE_EXPERIMENTAL_MOTION_SAFETY) {
       const uint8_t h = readHallState();
-
       if (h == 0 || h == 7) {
         tripSafetyFault("HALL_INVALID", "Hall state 000/111 before start");
         return;
       }
-
       if (hallQuietUs() < START_QUIET_US ||
-          stoppedForMs < START_QUIET_US / 1000) {
-        reversalPending = true;
-
-        if (stoppedForMs >= START_WAIT_LIMIT_MS) {
+          millis() - startWaitingAtMs < START_QUIET_US / 1000) {
+        reversalPending = reversePauseActive;
+        if (millis() - startWaitingAtMs >= START_WAIT_LIMIT_MS) {
           tripSafetyFault("WINDMILL", "rotor did not settle within 10 seconds");
         }
         return;
       }
+    } else if (reversePauseActive && millis() - startWaitingAtMs < OPEN_REVERSE_PAUSE_MS) {
+      reversalPending = true;
+      return;
     }
 
+    driveDirection = requestedDirection;
     reversalPending = false;
     reversePauseActive = false;
     startWaitingAtMs = 0;
-    driveDirection = requestedDirection;
-    overCurrentAtMs = 0;
-    invalidHallAtMs = 0;
+    overCurrentAtMs = invalidHallAtMs = 0;
     enableMotorNow();
+    resetSCurve(0.0f);
+    directionChange = false;
   }
-  const float targetRpm = clampf(cfg.maxRpm * requestedPercent / 100.0f,
-                                  cfg.minRpm, cfg.maxRpm);
-  rampedRadPerSec = rampToward(rampedRadPerSec,
-    rpmToRad(targetRpm) * driveDirection, rpmToRad(cfg.accelRpmPerSec) * dt);
+
+  float desiredRadPerSec = 0.0f;
+  if (!stopRequested) {
+    const float targetRpm = clampf(cfg.maxRpm * requestedPercent / 100.0f,
+                                   cfg.minRpm, cfg.maxRpm);
+    if (cfg.mode == OPEN_CURRENT_FOC) {
+      // Direct signed target: reversal is just another monotonic S-curve.
+      desiredRadPerSec = rpmToRad(targetRpm) * requestedDirection;
+    } else if (!directionChange) {
+      desiredRadPerSec = rpmToRad(targetRpm) * driveDirection;
+    } else {
+      reversalPending = true;
+    }
+  }
+
+  retargetSCurve(desiredRadPerSec, nowUs);
+  updateSCurve(nowUs);
+
+  // Only STOP and Hall-mode reversal need to actually reach zero and release
+  // the bridge.  OPEN-mode reversal crosses zero continuously with EN asserted.
+  const bool needsZeroRelease = stopRequested ||
+    (cfg.mode == HALL_CURRENT_FOC && directionChange);
+  const bool zeroTransitionComplete = needsZeroRelease && !speedCurve.active &&
+    fabsf(rampedRadPerSec) <= SCURVE_ZERO_EPS_RAD_S;
+
+  if (!zeroTransitionComplete && openCurrentFadeOut && !stopRequested &&
+      !(cfg.mode == HALL_CURRENT_FOC && directionChange)) {
+    startOpenCurrentFadeIn(nowUs, openCurrentScale);
+  }
+
+  // For a real STOP, fade q-current to zero before disabling the bridge.  OPEN
+  // reversal deliberately does NOT enter this path, avoiding the EN transition.
+  if (zeroTransitionComplete && cfg.mode == OPEN_CURRENT_FOC && !openCurrentFadeOut &&
+      openCurrentScale > 0.0005f) {
+    startOpenCurrentFadeOut(nowUs);
+  }
+  const bool openFadeOutDone = updateOpenCurrentEnvelope(nowUs);
+
   motor.loopFOC();
   if (ENABLE_EXPERIMENTAL_MOTION_SAFETY &&
       (!isfinite(motor.current.q) || !isfinite(motor.current.d) ||
-      !isfinite(motor.shaft_velocity))) {
+       !isfinite(motor.shaft_velocity))) {
     tripSafetyFault("NUMERIC", "non-finite control feedback");
     return;
   }
-  // Filtered vector current is an additional software supervisor, NOT a
-  // hardware short-circuit protector or guaranteed instantaneous current cap.
+
   const float magnitude = hypotf(motor.current.q, motor.current.d);
-  if (ENABLE_EXPERIMENTAL_MOTION_SAFETY && magnitude > cfg.currentLimitA * 1.5f) {
+  if (ENABLE_EXPERIMENTAL_MOTION_SAFETY &&
+      magnitude > cfg.currentLimitA * 1.5f) {
     if (!overCurrentAtMs) overCurrentAtMs = millis();
     if (millis() - overCurrentAtMs >= OVERCURRENT_HOLD_MS) {
       tripSafetyFault("OVERCURRENT", "filtered dq magnitude above 150 percent");
       return;
     }
-  } else overCurrentAtMs = 0;
+  } else {
+    overCurrentAtMs = 0;
+  }
+
   if (cfg.mode == HALL_CURRENT_FOC && ENABLE_EXPERIMENTAL_MOTION_SAFETY) {
     const uint8_t h = readHallState();
     if (h == 0 || h == 7) {
@@ -1171,10 +1377,39 @@ void runMotorControl() {
     } else {
       invalidHallAtMs = 0;
     }
-  } else {
-    invalidHallAtMs = 0;
   }
+
   motor.move(rampedRadPerSec);
+
+  // OPEN reversal is finished when the signed target has been reached.  There
+  // is no disable, pause or re-enable event at the zero crossing.
+  if (cfg.mode == OPEN_CURRENT_FOC && reversalPending && !speedCurve.active &&
+      !stopRequested) {
+    reversalPending = false;
+  }
+
+  if (zeroTransitionComplete) {
+    motor.move(0.0f);
+
+    if (cfg.mode == OPEN_CURRENT_FOC && !openFadeOutDone) {
+      runSafetyMonitor();
+      return;
+    }
+
+    disableMotorNow();
+    resetSCurve(0.0f);
+    if (cfg.mode == HALL_CURRENT_FOC && directionChange) {
+      reversePauseActive = true;
+      reversalPending = true;
+      startWaitingAtMs = millis();
+    } else {
+      reversalPending = false;
+      reversePauseActive = false;
+      startWaitingAtMs = 0;
+    }
+    return;
+  }
+
   runSafetyMonitor();
 }
 
@@ -1188,80 +1423,86 @@ void scheduleRestart(uint32_t delayMs = 500) {
 }
 
 void processPendingCommands() {
+  bool maintenancePending = false;
+  bool stopPending = false;
+  bool clearPending = false;
+
+  portENTER_CRITICAL(&stateMux);
+  maintenancePending = pendingSettings.valid || pendingWifi.valid ||
+                       pendingRecalibrate || pendingDefaults || pendingRestart;
+  stopPending = pendingStop;
+  clearPending = pendingClearFault;
+  portEXIT_CRITICAL(&stateMux);
+
+  // STOP is a normal smooth command. It cancels auto-retry but does NOT hard-cut
+  // PWM. Safety faults still call disableMotorNow() immediately.
+  if (stopPending) {
+    retryPolicy.cancel();
+    requestedPercent = 0.0f;
+    portENTER_CRITICAL(&stateMux);
+    pendingStop = false;
+    pendingControl.valid = false;
+    portEXIT_CRITICAL(&stateMux);
+  }
+
+  if (clearPending) {
+    portENTER_CRITICAL(&stateMux);
+    pendingClearFault = false;
+    portEXIT_CRITICAL(&stateMux);
+    clearSafetyFault();
+  }
+
+  // Settings, Wi-Fi writes, recalibration, defaults and restart first request a
+  // normal S-curve stop. The NVS/radio operation executes only once disabled.
+  if (maintenancePending && motorEnabled) {
+    retryPolicy.cancel();
+    requestedPercent = 0.0f;
+    portENTER_CRITICAL(&stateMux);
+    pendingControl.valid = false;
+    portEXIT_CRITICAL(&stateMux);
+    return;
+  }
+
   PendingControl pc{};
   PendingSettings ps{};
   PendingWifi pw{};
-  bool doStop = false;
-  bool doClearFault = false;
   bool doRecal = false;
   bool doDefaults = false;
   bool doRestart = false;
 
+  const uint32_t controlNowMs = millis();
   portENTER_CRITICAL(&stateMux);
-  if (pendingControl.valid) {
+  if (!maintenancePending && pendingControl.valid &&
+      (uint32_t)(controlNowMs - pendingControl.receivedAtMs) >= GUI_COMMAND_QUIET_MS) {
     pc = pendingControl;
     pendingControl.valid = false;
   }
-  if (pendingSettings.valid) {
-    ps = pendingSettings;
-    pendingSettings.valid = false;
-  }
-  if (pendingWifi.valid) {
-    pw = pendingWifi;
-    pendingWifi.valid = false;
-  }
-  doStop = pendingStop; pendingStop = false;
-  doClearFault = pendingClearFault; pendingClearFault = false;
+  if (pendingSettings.valid) { ps = pendingSettings; pendingSettings.valid = false; }
+  if (pendingWifi.valid) { pw = pendingWifi; pendingWifi.valid = false; }
   doRecal = pendingRecalibrate; pendingRecalibrate = false;
   doDefaults = pendingDefaults; pendingDefaults = false;
   doRestart = pendingRestart; pendingRestart = false;
+  if (maintenancePending) pendingControl.valid = false;
   portEXIT_CRITICAL(&stateMux);
 
-  const bool maintenance = ps.valid || pw.valid || doRecal || doDefaults || doRestart;
-  if (maintenance || doStop || doClearFault) {
-    retryPolicy.cancel();
-    requestedPercent = 0.0f;
-    rampedRadPerSec = 0.0f;
-    reversalPending = reversePauseActive = false;
-    startWaitingAtMs = 0;
-    disableMotorNow();
-    pc.valid = false;
-  }
   if (pc.valid && !safetyFaultLatched && !scheduledRestartAtMs) {
     requestedPercent = clampf(pc.percent, 0.0f, 100.0f);
     requestedDirection = (pc.direction < 0) ? -1 : 1;
-  }
-
-  if (doStop) {
-    requestedPercent = 0.0f;
-  }
-
-  if (doClearFault) {
-    clearSafetyFault();
   }
 
   if (ps.valid) {
     Config next = ps.value;
     validateConfig(next);
     const bool modeChanged = next.mode != cfg.mode;
-
-    // Keep existing Hall calibration unless explicitly recalibrated.
     next.hallCalValid = cfg.hallCalValid;
     next.hallZeroElectric = cfg.hallZeroElectric;
     next.hallDirection = cfg.hallDirection;
-
     portENTER_CRITICAL(&stateMux);
     cfg = next;
     portEXIT_CRITICAL(&stateMux);
     saveConfig();
-
-    if (modeChanged) {
-      requestedPercent = 0.0f;
-      disableMotorNow();
-      scheduleRestart(600);
-    } else if (motorReady) {
-      applyRuntimeConfig();
-    }
+    if (modeChanged) scheduleRestart(600);
+    else if (motorReady) applyRuntimeConfig();
   }
 
   if (pw.valid) {
@@ -1275,28 +1516,19 @@ void processPendingCommands() {
     cfg.hallZeroElectric = 0.0f;
     cfg.hallDirection = 1;
     saveConfig();
-    requestedPercent = 0.0f;
-    disableMotorNow();
     scheduleRestart(600);
   }
 
   if (doDefaults) {
     Config d = makeDefaultConfig();
-    // Wi-Fi credentials live under separate keys and are intentionally kept.
     portENTER_CRITICAL(&stateMux);
     cfg = d;
     portEXIT_CRITICAL(&stateMux);
     saveConfig();
-    requestedPercent = 0.0f;
-    disableMotorNow();
     scheduleRestart(600);
   }
 
-  if (doRestart) {
-    requestedPercent = 0.0f;
-    disableMotorNow();
-    scheduleRestart(400);
-  }
+  if (doRestart) scheduleRestart(400);
 }
 
 // ============================================================================
@@ -1305,9 +1537,41 @@ void processPendingCommands() {
 
 void updateTelemetry() {
   static uint32_t lastMs = 0;
+  static uint32_t lastWifiMs = 0;
+  static bool cachedStaConnected = false;
+  static int32_t cachedRssi = 0;
+  static char cachedStaIp[20] = "-";
+  static char cachedApIp[20] = "192.168.4.1";
+  static char cachedSsid[33] = "";
+
   const uint32_t now = millis();
   if (now - lastMs < 200) return;
   lastMs = now;
+
+  // Wi-Fi metadata is slow-changing. More importantly, do not call WiFi/String
+  // helpers while PWM is active: those calls can take locks / allocate heap and
+  // create periodic timing jitter. Cache network metadata only while fully stopped.
+  const bool motorTrafficSensitive = motorEnabled || speedCurve.active ||
+                                     reversalPending || reversePauseActive ||
+                                     requestedPercent > 0.01f;
+  // While PWM is active there is no periodic GUI polling, so avoid even the
+  // telemetry struct copy/critical section.  The accumulated loop-gap maximum
+  // remains available once the motor stops.
+  if (motorTrafficSensitive) return;
+  if (!motorTrafficSensitive && (now - lastWifiMs >= 2000 || lastWifiMs == 0)) {
+    lastWifiMs = now;
+    cachedStaConnected = WiFi.status() == WL_CONNECTED;
+    cachedRssi = cachedStaConnected ? WiFi.RSSI() : 0;
+    String staIp = cachedStaConnected ? WiFi.localIP().toString() : "-";
+    String apIp = WiFi.softAPIP().toString();
+    String ssid = cachedStaConnected ? WiFi.SSID() : "";
+    strncpy(cachedStaIp, staIp.c_str(), sizeof(cachedStaIp) - 1);
+    cachedStaIp[sizeof(cachedStaIp) - 1] = 0;
+    strncpy(cachedApIp, apIp.c_str(), sizeof(cachedApIp) - 1);
+    cachedApIp[sizeof(cachedApIp) - 1] = 0;
+    strncpy(cachedSsid, ssid.c_str(), sizeof(cachedSsid) - 1);
+    cachedSsid[sizeof(cachedSsid) - 1] = 0;
+  }
 
   Telemetry t{};
   t.motorReady = motorReady;
@@ -1319,48 +1583,48 @@ void updateTelemetry() {
   t.commandedRpm = radToRpm(rampedRadPerSec);
   t.currentLimitA = cfg.currentLimitA;
   t.voltageLimitV = cfg.motorVoltageLimitV;
-  t.hallTransitions = hallTransitions;
-  t.hallRpm = safetyHallRpm;
-  t.hallWatchdogEnabled = hallWatchdogEnabled;
-  t.hallQuietMs = motorEnabled ? (millis() - lastHallActivityMs) : 0;
+  t.loopGapUs = loopGapWindowMaxUs;
+  loopGapWindowMaxUs = 0;
+  t.sCurveActive = speedCurve.active;
+
+  if (cfg.mode == HALL_CURRENT_FOC) {
+    t.hallTransitions = hallTransitions;
+    t.hallRpm = safetyHallRpm;
+    t.hallWatchdogEnabled = hallWatchdogEnabled;
+    t.hallQuietMs = motorEnabled ? (millis() - lastHallActivityMs) : 0;
+    t.measuredRpm = radToRpm(hall.getVelocity());
+    t.measuredRpmValid = motorReady;
+  } else {
+    t.hallTransitions = 0;
+    t.hallRpm = 0.0f;
+    t.hallWatchdogEnabled = false;
+    t.hallQuietMs = 0;
+    t.measuredRpm = 0.0f;
+    t.measuredRpmValid = false;
+  }
+
   t.faultLatched = safetyFaultLatched;
   t.retryPending = retryPolicy.pending;
   t.retryAttempts = retryPolicy.attempts;
   t.retryRemainingMs = retryPolicy.remainingMs(now);
 
-  // Only Hall mode has a real measured rotor RPM.
-  // OPEN_CURRENT_FOC deliberately has no rotor feedback.
-  if (cfg.mode == HALL_CURRENT_FOC && motorReady) {
-    t.measuredRpm = radToRpm(hall.getVelocity());
-    t.measuredRpmValid = true;
-  } else {
-    t.measuredRpm = 0.0f;
-    t.measuredRpmValid = false;
-    t.hallTransitions = 0;
-    t.hallRpm = 0.0f;
-    t.hallWatchdogEnabled = false;
-    t.hallQuietMs = 0;
-  }
-
   if (motorReady && motorEnabled) {
-    // SimpleFOC already maintains filtered D/Q currents during foc_current.
     t.iqA = motor.current.q;
     t.idA = motor.current.d;
+    t.uqV = motor.voltage.q;
+    t.udV = motor.voltage.d;
   } else {
     t.iqA = 0.0f;
     t.idA = 0.0f;
+    t.uqV = 0.0f;
+    t.udV = 0.0f;
   }
 
-  t.staConnected = WiFi.status() == WL_CONNECTED;
-  t.wifiRssi = t.staConnected ? WiFi.RSSI() : 0;
-
-  String staIp = t.staConnected ? WiFi.localIP().toString() : "-";
-  String apIp = WiFi.softAPIP().toString();
-  String ssid = t.staConnected ? WiFi.SSID() : "";
-
-  strncpy(t.staIp, staIp.c_str(), sizeof(t.staIp) - 1);
-  strncpy(t.apIp, apIp.c_str(), sizeof(t.apIp) - 1);
-  strncpy(t.staSsid, ssid.c_str(), sizeof(t.staSsid) - 1);
+  t.staConnected = cachedStaConnected;
+  t.wifiRssi = cachedRssi;
+  strncpy(t.staIp, cachedStaIp, sizeof(t.staIp) - 1);
+  strncpy(t.apIp, cachedApIp, sizeof(t.apIp) - 1);
+  strncpy(t.staSsid, cachedSsid, sizeof(t.staSsid) - 1);
   strncpy(t.fault, faultText, sizeof(t.fault) - 1);
 
   portENTER_CRITICAL(&stateMux);
@@ -1409,9 +1673,18 @@ void setupWiFi() {
     WiFi.begin(ssid.c_str(), pass.c_str());
     Serial.print("Connecting STA to: ");
     Serial.println(ssid);
-    // Do not wait for a saved home network. The recovery AP/server must be
-    // reachable immediately even when that network is absent.
-    Serial.println("STA connection continues in background; AP remains available.");
+
+    const uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 7000) {
+      delay(50);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("STA connected. IP: ");
+      Serial.println(WiFi.localIP());
+    } else {
+      Serial.println("STA not connected; recovery AP remains available at 192.168.4.1");
+    }
   }
 
   // Friendly local hostname. 192.168.4.1 remains the guaranteed recovery URL.
@@ -1449,6 +1722,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
  <div class="card"><div class="label">Commanded</div><div id="cmdRpm" class="value">0 rpm</div></div>
  <div class="card"><div class="label">Measured</div><div id="measRpm" class="value">-</div></div>
  <div class="card"><div class="label">Iq / Id</div><div id="curr" class="value">0 / 0 A</div></div>
+ <div class="card"><div class="label">Uq / Ud</div><div id="volt" class="value">0 / 0 V</div></div>
  <div class="card"><div class="label">Wi-Fi</div><div id="wifi" class="value">AP</div></div>
 </div>
 
@@ -1476,9 +1750,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div><div class="label">Hall watchdog</div><div id="hallWatch" class="value">-</div></div>
   <div><div class="label">Hall RPM</div><div id="hallRpm" class="value">0 rpm</div></div>
   <div><div class="label">Hall quiet</div><div id="hallQuiet" class="value">0 ms</div></div>
+  <div><div class="label">Loop gap (200 ms max)</div><div id="loopGap" class="value">0 us</div></div>
   <div><div class="label">Fault latch</div><div id="faultLatch" class="value">CLEAR</div></div>
  </div>
- <div class="note" style="margin-top:10px">In OPEN mode Hall is completely unused: no Hall init, reads, interrupts, RPM feedback or watchdog. OPEN mode keeps real current feedback only. Hall stall/overload protection is available only in HALL CURRENT FOC.</div>
+ <div class="note" style="margin-top:10px">In OPEN mode Hall is completely unused. In HALL mode, a hard stall or persistent low-RPM/high-current overload disables the driver immediately and latches the fault.</div>
 </div>
 
 <div class="card section">
@@ -1487,10 +1762,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div class="field"><label>Mode</label><select id="mode"><option value="0">Open-loop + real current FOC</option><option value="1">Hall closed-loop + current FOC</option></select></div>
   <div class="field"><label>Max RPM</label><input id="maxRpm" type="number" step="10"></div>
   <div class="field"><label>Minimum running RPM</label><input id="minRpm" type="number" step="10"></div>
-  <div class="field"><label>Acceleration RPM/s</label><input id="accel" type="number" step="10"></div>
+  <div class="field"><label>Full 0→100% S-curve time (s)</label><input id="rampTime" type="number" min="0.25" max="8" step="0.1"></div>
   <div class="field"><label>Current limit A (hard max 2 A)</label><input id="currentLimit" type="number" step="0.05"></div>
-  <div class="field"><label>Motor voltage limit V (hard max 6 V)</label><input id="voltageLimit" type="number" step="0.1"></div>
-  <div class="field"><label>Hall alignment voltage V</label><input id="alignVoltage" type="number" step="0.05"></div>
+  <div class="field"><label>Motor voltage limit V (hard max 3 V)</label><input id="voltageLimit" type="number" step="0.1"></div>
+  <div class="field"><label>FOC alignment voltage V (current sense / Hall)</label><input id="alignVoltage" type="number" step="0.05"></div>
   <div class="field"><label>Current PI - P</label><input id="currentP" type="number" step="0.01"></div>
   <div class="field"><label>Current PI - I</label><input id="currentI" type="number" step="1"></div>
   <div class="field"><label>Current LPF Tf s</label><input id="currentTf" type="number" step="0.0005"></div>
@@ -1504,7 +1779,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <button onclick="resetDefaults()">Safe defaults</button>
   <button onclick="restartEsp()">Restart</button>
  </div>
- <div class="note" style="margin-top:10px">Changing control mode restarts the ESP32. Hall recalibration also restarts and may move the motor briefly during FOC alignment. The fan boots without a run command, but electrical alignment can move it briefly.</div>
+ <div class="note" style="margin-top:10px">Changing control mode restarts the ESP32. Hall recalibration also restarts and may move the motor briefly during FOC alignment. In OPEN mode the same alignment-voltage setting is used only for current-sense phase/sign alignment; Hall remains unused. The fan boots without a run command, but electrical alignment can move it briefly.</div>
  <div id="settingsMsg" class="msg"></div>
 </div>
 
@@ -1515,98 +1790,102 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div class="field"><label>Password</label><input id="pass" type="password" maxlength="64" autocomplete="new-password"></div>
  </div>
  <div class="row" style="margin-top:12px">
-  <button onclick="scanWifi()">Scan 2.4 GHz networks</button>
+  
   <button class="primary" onclick="saveWifi()">Save Wi-Fi & restart</button>
- 
  </div>
  <div id="scanMsg" class="msg"></div>
- <div class="note" style="margin-top:10px">Wi-Fi scan is allowed only while the motor is fully stopped. Recovery AP is always available: <b>MaxxFan-Setup</b> / <b>MaxxFan123</b>, normally at <b>192.168.4.1</b>. You can also try <b>maxxfan.local</b>. The saved home password is never returned by the status API.</div>
+ <div class="note" style="margin-top:10px">Enter the network SSID manually. Radio scans are disabled. Recovery AP is always available: <b>MaxxFan-Setup</b> / <b>MaxxFan123</b>, normally at <b>192.168.4.1</b>. You can also try <b>maxxfan.local</b>. The saved home password is never returned by the status API.</div>
  <div id="wifiMsg" class="msg"></div>
 </div>
 
 <div class="card section note">
- <b>Current mode note:</b> OPEN mode has real phase-current feedback, but no rotor-angle feedback. It is therefore current-closed-loop / angle-open-loop. HALL mode closes both rotor velocity/angle information and current control.<br><br>
+ <b>Current mode note:</b> OPEN mode has real phase-current feedback but does not initialize or read the Hall sensor. HALL mode closes both rotor velocity/angle information and current control. All normal speed changes use a monotonic quintic S-curve. OPEN-mode current is softly faded at enable/disable to avoid the zero-speed click. The GUI intentionally makes no periodic network requests while the motor is active.<br><br>
  <span id="extra"></span>
 </div>
 </div>
 <script>
-let dir=1, first=true, timer=null, refreshTimer=null;
+let dir=1, first=true, timer=null, refreshTimer=null, fullRampMs=1800;
+let controlBusy=false, controlDirty=false;
 const $=id=>document.getElementById(id);
 function enc(o){return Object.entries(o).map(([k,v])=>encodeURIComponent(k)+'='+encodeURIComponent(v)).join('&')}
 async function post(url,obj){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-MaxxFan-Control':'1'},body:enc(obj)});return await r.text()}
 function stopRefresh(){if(refreshTimer!==null){clearTimeout(refreshTimer);refreshTimer=null}}
 function scheduleRefresh(ms){stopRefresh();if(ms>0)refreshTimer=setTimeout(refresh,ms)}
-function setDir(d){dir=d;$('fwd').classList.toggle('active',d===1);$('rev').classList.toggle('active',d===-1);sendControl()}
-async function sendControl(){stopRefresh();await post('/api/control',{speed:$('speed').value,dir});}
-$('speed').addEventListener('input',()=>{$('speedText').textContent=$('speed').value;clearTimeout(timer);timer=setTimeout(sendControl,120)});
-async function stopNow(){clearTimeout(timer);stopRefresh();$('speed').value=0;$('speedText').textContent=0;await post('/api/stop',{});$('ctrlMsg').textContent='Driver disabled; fan coasting';refresh()}
-async function clearFaultNow(){clearTimeout(timer);stopRefresh();$('speed').value=0;$('speedText').textContent=0;$('ctrlMsg').textContent=await post('/api/clear-fault',{});refresh()}
+function setDirUI(){$('fwd').classList.toggle('active',dir===1);$('rev').classList.toggle('active',dir===-1)}
+function setDir(d){clearTimeout(timer);dir=d;setDirUI();queueControl()}
+function queueControl(){stopRefresh();controlDirty=true;flushControl()}
+async function flushControl(){
+ if(controlBusy)return;
+ controlBusy=true;
+ try{
+  while(controlDirty){
+   controlDirty=false;
+   const sp=Number($('speed').value), d=dir;
+   try{await post('/api/control',{speed:sp,dir:d})}catch(e){$('fault').textContent='GUI command connection lost'}
+  }
+ }finally{controlBusy=false}
+}
+$('speed').addEventListener('input',()=>{$('speedText').textContent=$('speed').value});
+$('speed').addEventListener('change',()=>{clearTimeout(timer);queueControl()});
+async function stopNow(){
+ clearTimeout(timer);stopRefresh();controlDirty=false;
+ $('speed').value=0;$('speedText').textContent=0;
+ try{await post('/api/stop',{});$('ctrlMsg').textContent='Smooth stop requested'}catch(e){$('fault').textContent='STOP connection lost'}
+ // No network traffic during the S-curve. Refresh only after the worst-case
+ // full ramp time plus margin, when the driver should already be disabled.
+ scheduleRefresh(fullRampMs+700);
+}
+async function clearFaultNow(){clearTimeout(timer);stopRefresh();$('speed').value=0;$('speedText').textContent=0;$('ctrlMsg').textContent=await post('/api/clear-fault',{});scheduleRefresh(800)}
 function f(n,d=3){return Number(n).toFixed(d)}
+function applyStatus(s){
+ $('modeCard').textContent=s.mode===1?'HALL CURRENT FOC':'OPEN CURRENT FOC';
+ $('motorCard').textContent=!s.ready?'FAULT':s.retry_pending?'RETRY IN '+Math.ceil(s.retry_remaining_ms/1000)+' s':s.fault_latched?'FAULT LATCHED':s.reversing?'REVERSING / SETTLING':s.enabled?(s.scurve?'RAMPING':'RUNNING'):'STOPPED';
+ $('cmdRpm').textContent=f(s.commanded_rpm,0)+' rpm';
+ $('measRpm').textContent=s.measured_valid?f(s.measured_rpm,0)+' rpm':'open-loop';
+ $('curr').textContent=f(s.iq,2)+' / '+f(s.id,2)+' A';
+ $('volt').textContent=f(s.uq,2)+' / '+f(s.ud,2)+' V';
+ $('wifi').textContent=s.sta_connected?(s.sta_ip+' · '+s.rssi+' dBm'):'AP '+s.ap_ip;
+ $('fault').textContent=(s.fault||'')+(s.retry_pending?' — automatic retry '+(s.retry_attempts+1)+'/3; STOP cancels':'');
+ $('clearFaultBtn').style.display=s.fault_latched?'inline-block':'none';
+ $('hallWatch').textContent=s.hall_watchdog?'ACTIVE':'OFF';
+ $('hallRpm').textContent=s.hall_watchdog?f(s.hall_rpm,0)+' rpm':'-';
+ $('hallQuiet').textContent=s.hall_watchdog?s.hall_quiet_ms+' ms':'-';
+ $('loopGap').textContent=s.loop_gap_us+' us';
+ $('faultLatch').textContent=s.fault_latched?'LATCHED':'CLEAR';
+ $('extra').textContent='Current limit '+f(s.current_limit,2)+' A · voltage limit '+f(s.voltage_limit,2)+' V · telemetry + Wi-Fi polling paused while motor runs';
+ if(first){dir=s.requested_dir<0?-1:1;setDirUI();$('speed').value=Math.round(s.requested_percent);$('speedText').textContent=Math.round(s.requested_percent);first=false}
+}
 async function refresh(){
  try{
   const s=await (await fetch('/api/status',{cache:'no-store'})).json();
-  $('modeCard').textContent=s.mode===1?'HALL CURRENT FOC':'OPEN CURRENT FOC';
-  $('motorCard').textContent=!s.ready?'FAULT':s.retry_pending?'RETRY IN '+Math.ceil(s.retry_remaining_ms/1000)+' s':s.fault_latched?'FAULT LATCHED':s.reversing?'WAITING FOR ROTOR':s.enabled?'RUNNING':'STOPPED';
-  $('cmdRpm').textContent=f(s.commanded_rpm,0)+' rpm';
-  $('measRpm').textContent=s.measured_valid?f(s.measured_rpm,0)+' rpm':'open-loop';
-  $('curr').textContent=f(s.iq,2)+' / '+f(s.id,2)+' A';
-  $('wifi').textContent=s.sta_connected?(s.sta_ip+' · '+s.rssi+' dBm'):'AP '+s.ap_ip;
-  $('fault').textContent=(s.fault||'')+(s.retry_pending?' — automatic retry '+(s.retry_attempts+1)+'/3; STOP cancels':'');
-  $('clearFaultBtn').style.display=s.fault_latched?'inline-block':'none';
-  $('hallWatch').textContent=s.hall_watchdog?'ACTIVE':'OFF';
-  $('hallRpm').textContent=f(s.hall_rpm,0)+' rpm';
-  $('hallQuiet').textContent=s.hall_quiet_ms+' ms';
-  $('faultLatch').textContent=s.fault_latched?'LATCHED':'CLEAR';
-  $('extra').textContent='Hall transitions: '+s.hall_transitions+' · current limit '+f(s.current_limit,2)+' A · voltage limit '+f(s.voltage_limit,2)+' V';
-  if(first){
-   dir=s.requested_dir<0?-1:1;setDirUI();
-   $('speed').value=Math.round(s.requested_percent);$('speedText').textContent=Math.round(s.requested_percent);
-   const c=s.config;
-   $('mode').value=c.mode;$('maxRpm').value=c.max_rpm;$('minRpm').value=c.min_rpm;$('accel').value=c.accel_rpm_s;
-   $('currentLimit').value=c.current_limit;$('voltageLimit').value=c.voltage_limit;$('alignVoltage').value=c.align_voltage;
-   $('currentP').value=c.current_p;$('currentI').value=c.current_i;$('currentTf').value=c.current_tf;
-   $('velocityP').value=c.velocity_p;$('velocityI').value=c.velocity_i;$('velocityTf').value=c.velocity_tf;
-   $('rpmScale').textContent='max '+f(c.max_rpm,0)+' rpm';
-   first=false;
-  }
-  // Do not continuously query the ESP32 while PWM is active: on a small supply
-  // or a busy Wi-Fi task, periodic HTTP/heap activity can modulate the motor.
-  // The screen remains live while stopped and refreshes after an explicit STOP.
-  if(!s.enabled && s.requested_percent<=0.1 && !document.hidden) scheduleRefresh(2000);
- }catch(e){$('fault').textContent='GUI connection lost — motor state unknown; reconnect to MaxxFan-Setup and open 192.168.4.1';if(!document.hidden)scheduleRefresh(2000)}
+  applyStatus(s);
+  // Exactly like the known-clean 3.7 principle: do NOT generate periodic Wi-Fi
+  // traffic while PWM/control is active.
+  if(!s.enabled && !s.reversing && !s.scurve && Number(s.requested_percent)<=0.1 && !document.hidden) scheduleRefresh(2000);
+ }catch(e){$('fault').textContent='GUI connection lost';if(!document.hidden)scheduleRefresh(2000)}
 }
-function setDirUI(){$('fwd').classList.toggle('active',dir===1);$('rev').classList.toggle('active',dir===-1)}
+async function loadConfig(){
+ try{const c=await (await fetch('/api/config',{cache:'no-store'})).json();
+  $('mode').value=c.mode;$('maxRpm').value=c.max_rpm;$('minRpm').value=c.min_rpm;
+  const rt=Number(c.max_rpm)/Math.max(Number(c.accel_rpm_s),1);fullRampMs=Math.max(250,Math.min(8000,rt*1000));$('rampTime').value=(fullRampMs/1000).toFixed(2);
+  $('currentLimit').value=c.current_limit;$('voltageLimit').value=c.voltage_limit;$('alignVoltage').value=c.align_voltage;
+  $('currentP').value=c.current_p;$('currentI').value=c.current_i;$('currentTf').value=c.current_tf;
+  $('velocityP').value=c.velocity_p;$('velocityI').value=c.velocity_i;$('velocityTf').value=c.velocity_tf;
+  $('rpmScale').textContent='max '+f(c.max_rpm,0)+' rpm';
+ }catch(e){$('fault').textContent='Config connection lost'}
+}
 async function saveSettings(){
- const obj={mode:$('mode').value,maxRpm:$('maxRpm').value,minRpm:$('minRpm').value,accel:$('accel').value,currentLimit:$('currentLimit').value,voltageLimit:$('voltageLimit').value,alignVoltage:$('alignVoltage').value,currentP:$('currentP').value,currentI:$('currentI').value,currentTf:$('currentTf').value,velocityP:$('velocityP').value,velocityI:$('velocityI').value,velocityTf:$('velocityTf').value};
- $('settingsMsg').textContent=await post('/api/settings',obj);setTimeout(()=>location.reload(),900)
+ const maxRpm=Math.max(Number($('maxRpm').value),1), rampTime=Math.max(Number($('rampTime').value),0.25);
+ const accel=maxRpm/rampTime;
+ const obj={mode:$('mode').value,maxRpm:$('maxRpm').value,minRpm:$('minRpm').value,accel,currentLimit:$('currentLimit').value,voltageLimit:$('voltageLimit').value,alignVoltage:$('alignVoltage').value,currentP:$('currentP').value,currentI:$('currentI').value,currentTf:$('currentTf').value,velocityP:$('velocityP').value,velocityI:$('velocityI').value,velocityTf:$('velocityTf').value};
+ stopRefresh();$('settingsMsg').textContent=await post('/api/settings',obj)
 }
-async function recalHall(){if(confirm('Clear saved Hall calibration and restart? The motor may move during calibration.')){$('settingsMsg').textContent=await post('/api/recal',{});setTimeout(()=>location.reload(),1500)}}
-async function resetDefaults(){if(confirm('Restore safe motor defaults? Wi-Fi credentials are kept.')){$('settingsMsg').textContent=await post('/api/defaults',{});setTimeout(()=>location.reload(),1200)}}
-async function restartEsp(){$('settingsMsg').textContent=await post('/api/restart',{});setTimeout(()=>location.reload(),1200)}
-async function scanWifi(){
- $('scanMsg').textContent='Scanning 2.4 GHz networks...';
- try{
-  const r=await fetch('/api/wifi-scan',{cache:'no-store'});
-  if(!r.ok){$('scanMsg').textContent=await r.text();return}
-  const nets=await r.json();
-  const dl=$('wifiList');dl.innerHTML='';
-  const seen=new Set();
-  nets.sort((a,b)=>b.rssi-a.rssi);
-  let count=0;
-  for(const n of nets){
-   if(!n.ssid || seen.has(n.ssid)) continue;
-   seen.add(n.ssid);
-   const o=document.createElement('option');
-   o.value=n.ssid;
-   o.label=n.rssi+' dBm'+(n.secure?' - secured':' - open');
-   dl.appendChild(o);count++;
-  }
-  $('scanMsg').textContent=count?count+' network(s) found. Click the SSID field to choose.':'No visible network found.';
- }catch(e){$('scanMsg').textContent='Wi-Fi scan failed'}
-}
-async function saveWifi(){$('wifiMsg').textContent=await post('/api/wifi',{ssid:$('ssid').value,pass:$('pass').value});setTimeout(()=>location.reload(),1800)}
+async function recalHall(){if(confirm('Clear saved Hall calibration and restart? The motor may move during calibration.')){stopRefresh();$('settingsMsg').textContent=await post('/api/recal',{})}}
+async function resetDefaults(){if(confirm('Restore safe motor defaults? Wi-Fi credentials are kept.')){stopRefresh();$('settingsMsg').textContent=await post('/api/defaults',{})}}
+async function restartEsp(){stopRefresh();$('settingsMsg').textContent=await post('/api/restart',{})}
+async function saveWifi(){stopRefresh();$('wifiMsg').textContent=await post('/api/wifi',{ssid:$('ssid').value,pass:$('pass').value})}
 document.addEventListener('visibilitychange',()=>{if(document.hidden)stopRefresh();else refresh()});
-refresh();
+loadConfig();refresh();
 </script></body></html>
 )rawliteral";
 
@@ -1663,64 +1942,113 @@ bool authorizeRequest(AsyncWebServerRequest* request) {
   }
   return true;
 }
+void jsonSafeCopy(const char* src, char* dst, size_t dstSize) {
+  if (!dstSize) return;
+  size_t n = 0;
+  if (src) {
+    while (*src && n + 1 < dstSize) {
+      const char c = *src++;
+      // Fault strings are firmware-generated. Replace JSON-breaking/control chars
+      // instead of allocating a temporary escaped String in the live path.
+      dst[n++] = (c == '"' || c == '\\' || (uint8_t)c < 0x20) ? '_' : c;
+    }
+  }
+  dst[n] = 0;
+}
+
+size_t buildLiveJson(const Telemetry& t, char* out, size_t outSize) {
+  char safeFault[96];
+  jsonSafeCopy(t.fault, safeFault, sizeof(safeFault));
+  const int written = snprintf(out, outSize,
+    "{\"ready\":%s,\"enabled\":%s,\"reversing\":%s,\"scurve\":%s,"
+    "\"mode\":%u,\"requested_percent\":%.1f,\"requested_dir\":%d,"
+    "\"commanded_rpm\":%.1f,\"measured_valid\":%s,\"measured_rpm\":%.1f,"
+    "\"iq\":%.3f,\"id\":%.3f,\"uq\":%.3f,\"ud\":%.3f,\"current_limit\":%.3f,\"voltage_limit\":%.3f,"
+    "\"hall_rpm\":%.1f,\"hall_watchdog\":%s,\"hall_quiet_ms\":%lu,"
+    "\"loop_gap_us\":%lu,\"fault_latched\":%s,\"retry_pending\":%s,"
+    "\"retry_attempts\":%u,\"retry_remaining_ms\":%lu,\"sta_connected\":%s,"
+    "\"rssi\":%ld,\"sta_ip\":\"%s\",\"ap_ip\":\"%s\",\"fault\":\"%s\"}",
+    t.motorReady ? "true" : "false",
+    t.enabled ? "true" : "false",
+    t.reversing ? "true" : "false",
+    t.sCurveActive ? "true" : "false",
+    (unsigned)t.mode,
+    t.requestedPercent,
+    (int)t.requestedDirection,
+    t.commandedRpm,
+    t.measuredRpmValid ? "true" : "false",
+    t.measuredRpm,
+    t.iqA,
+    t.idA,
+    t.uqV,
+    t.udV,
+    t.currentLimitA,
+    t.voltageLimitV,
+    t.hallRpm,
+    t.hallWatchdogEnabled ? "true" : "false",
+    (unsigned long)t.hallQuietMs,
+    (unsigned long)t.loopGapUs,
+    t.faultLatched ? "true" : "false",
+    t.retryPending ? "true" : "false",
+    (unsigned)t.retryAttempts,
+    (unsigned long)t.retryRemainingMs,
+    t.staConnected ? "true" : "false",
+    (long)t.wifiRssi,
+    t.staIp,
+    t.apIp,
+    safeFault);
+  if (written < 0 || (size_t)written >= outSize) {
+    if (outSize) out[0] = 0;
+    return 0;
+  }
+  return (size_t)written;
+}
+
+String buildConfigJson(const Config& c) {
+  String j;
+  j.reserve(500);
+  j += "{";
+  j += "\"mode\":" + String((int)c.mode);
+  j += ",\"max_rpm\":" + String(c.maxRpm, 1);
+  j += ",\"min_rpm\":" + String(c.minRpm, 1);
+  j += ",\"accel_rpm_s\":" + String(c.accelRpmPerSec, 1);
+  j += ",\"current_limit\":" + String(c.currentLimitA, 3);
+  j += ",\"voltage_limit\":" + String(c.motorVoltageLimitV, 3);
+  j += ",\"align_voltage\":" + String(c.alignVoltageV, 3);
+  j += ",\"current_p\":" + String(c.currentP, 4);
+  j += ",\"current_i\":" + String(c.currentI, 3);
+  j += ",\"current_tf\":" + String(c.currentTf, 5);
+  j += ",\"velocity_p\":" + String(c.velocityP, 5);
+  j += ",\"velocity_i\":" + String(c.velocityI, 4);
+  j += ",\"velocity_tf\":" + String(c.velocityTf, 5);
+  j += ",\"hall_cal_valid\":" + String(c.hallCalValid ? "true" : "false");
+  j += "}";
+  return j;
+}
+
 void setupWebServer() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
     if (!authorizeRequest(request)) return;
-    request->send_P(200, "text/html", INDEX_HTML);
+    AsyncWebServerResponse* response = request->beginResponse_P(200, "text/html", INDEX_HTML);
+    response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    request->send(response);
   });
 
   server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* request) {
     if (!authorizeRequest(request)) return;
-    const Telemetry t = telemetrySnapshot();
-    const Config c = configSnapshot();
+    char json[768];
+    if (!buildLiveJson(telemetrySnapshot(), json, sizeof(json))) {
+      request->send(500, "text/plain", "Status serialization failed");
+      return;
+    }
+    AsyncWebServerResponse* response = request->beginResponse(200, "application/json", json);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+  });
 
-    String j;
-    j.reserve(1050);
-    j += "{";
-    j += "\"ready\":" + String(t.motorReady ? "true" : "false");
-    j += ",\"enabled\":" + String(t.enabled ? "true" : "false");
-    j += ",\"reversing\":" + String(t.reversing ? "true" : "false");
-    j += ",\"mode\":" + String((int)t.mode);
-    j += ",\"requested_percent\":" + String(t.requestedPercent, 1);
-    j += ",\"requested_dir\":" + String((int)t.requestedDirection);
-    j += ",\"commanded_rpm\":" + String(t.commandedRpm, 1);
-    j += ",\"measured_valid\":" + String(t.measuredRpmValid ? "true" : "false");
-    j += ",\"measured_rpm\":" + String(t.measuredRpm, 1);
-    j += ",\"iq\":" + String(t.iqA, 3);
-    j += ",\"id\":" + String(t.idA, 3);
-    j += ",\"current_limit\":" + String(t.currentLimitA, 3);
-    j += ",\"voltage_limit\":" + String(t.voltageLimitV, 3);
-    j += ",\"hall_transitions\":" + String(t.hallTransitions);
-    j += ",\"hall_rpm\":" + String(t.hallRpm, 1);
-    j += ",\"hall_watchdog\":" + String(t.hallWatchdogEnabled ? "true" : "false");
-    j += ",\"hall_quiet_ms\":" + String(t.hallQuietMs);
-    j += ",\"fault_latched\":" + String(t.faultLatched ? "true" : "false");
-    j += ",\"retry_pending\":" + String(t.retryPending ? "true" : "false");
-    j += ",\"retry_attempts\":" + String(t.retryAttempts);
-    j += ",\"retry_remaining_ms\":" + String(t.retryRemainingMs);
-    j += ",\"sta_connected\":" + String(t.staConnected ? "true" : "false");
-    j += ",\"rssi\":" + String(t.wifiRssi);
-    j += ",\"sta_ip\":\"" + jsonEscape(t.staIp) + "\"";
-    j += ",\"ap_ip\":\"" + jsonEscape(t.apIp) + "\"";
-    j += ",\"ssid\":\"" + jsonEscape(t.staSsid) + "\"";
-    j += ",\"fault\":\"" + jsonEscape(t.fault) + "\"";
-    j += ",\"config\":{";
-    j += "\"mode\":" + String((int)c.mode);
-    j += ",\"max_rpm\":" + String(c.maxRpm, 1);
-    j += ",\"min_rpm\":" + String(c.minRpm, 1);
-    j += ",\"accel_rpm_s\":" + String(c.accelRpmPerSec, 1);
-    j += ",\"current_limit\":" + String(c.currentLimitA, 3);
-    j += ",\"voltage_limit\":" + String(c.motorVoltageLimitV, 3);
-    j += ",\"align_voltage\":" + String(c.alignVoltageV, 3);
-    j += ",\"current_p\":" + String(c.currentP, 4);
-    j += ",\"current_i\":" + String(c.currentI, 3);
-    j += ",\"current_tf\":" + String(c.currentTf, 5);
-    j += ",\"velocity_p\":" + String(c.velocityP, 5);
-    j += ",\"velocity_i\":" + String(c.velocityI, 4);
-    j += ",\"velocity_tf\":" + String(c.velocityTf, 5);
-    j += ",\"hall_cal_valid\":" + String(c.hallCalValid ? "true" : "false");
-    j += "}}";
-
+  server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!authorizeRequest(request)) return;
+    const String j = buildConfigJson(configSnapshot());
     AsyncWebServerResponse* response = request->beginResponse(200, "application/json", j);
     response->addHeader("Cache-Control", "no-store");
     request->send(response);
@@ -1733,7 +2061,7 @@ void setupWebServer() {
       portENTER_CRITICAL(&stateMux);
       pendingStop = true;
       portEXIT_CRITICAL(&stateMux);
-      request->send(200, "text/plain", "Stop requested; automatic retry cancelled.");
+      request->send(200, "text/plain", "Smooth stop requested; automatic retry cancelled.");
       return;
     }
     if (telemetrySnapshot().faultLatched) {
@@ -1748,11 +2076,12 @@ void setupWebServer() {
     pc.valid = true;
     pc.percent = clampf(postFloat(request, "speed", 0.0f), 0.0f, 100.0f);
     pc.direction = postInt(request, "dir", 1) < 0 ? -1 : 1;
+    pc.receivedAtMs = millis();
 
     portENTER_CRITICAL(&stateMux);
     pendingControl = pc;
     portEXIT_CRITICAL(&stateMux);
-    request->send(200, "text/plain", "OK");
+    request->send(204, "text/plain", "");
   });
 
   server.on("/api/stop", HTTP_POST, [](AsyncWebServerRequest* request) {
@@ -1798,49 +2127,21 @@ void setupWebServer() {
     pendingSettings = ps;
     portEXIT_CRITICAL(&stateMux);
 
-    request->send(200, "text/plain", "Settings accepted. Mode changes reboot automatically.");
+    request->send(200, "text/plain", "Settings accepted. Fan will S-curve stop before applying them.");
   });
 
   server.on("/api/wifi-scan", HTTP_GET, [](AsyncWebServerRequest* request) {
     if (!authorizeRequest(request)) return;
     const Telemetry t = telemetrySnapshot();
 
-    // Synchronous radio scanning is permitted only with the motor fully off.
-    if (t.enabled || t.reversing || t.requestedPercent > 0.1f ||
-        scheduledRestartAtMs != 0) {
-      request->send(409, "text/plain",
-                    "Stop the motor completely before scanning Wi-Fi.");
+    // A synchronous scan can briefly occupy the Wi-Fi stack. Do it only
+    // while the fan is fully stopped so it cannot disturb motor control.
+    if (t.enabled || t.reversing || t.requestedPercent > 0.1f) {
+      request->send(409, "text/plain", "Stop the motor before scanning Wi-Fi.");
       return;
     }
 
-    const int count = WiFi.scanNetworks(false, true);
-    if (count < 0) {
-      request->send(500, "text/plain", "Wi-Fi scan failed.");
-      return;
-    }
-
-    String json;
-    json.reserve(32 + count * 72);
-    json += "[";
-
-    for (int i = 0; i < count; ++i) {
-      if (i) json += ",";
-      json += "{\"ssid\":\"";
-      json += jsonEscape(WiFi.SSID(i).c_str());
-      json += "\",\"rssi\":";
-      json += String(WiFi.RSSI(i));
-      json += ",\"secure\":";
-      json += (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "false" : "true";
-      json += "}";
-    }
-
-    json += "]";
-    WiFi.scanDelete();
-
-    AsyncWebServerResponse* response =
-      request->beginResponse(200, "application/json", json);
-    response->addHeader("Cache-Control", "no-store");
-    request->send(response);
+    request->send(409, "text/plain", "Enter SSID manually; radio scanning disabled to protect motor timing.");
   });
 
   server.on("/api/wifi", HTTP_POST, [](AsyncWebServerRequest* request) {
@@ -1921,9 +2222,11 @@ void printSerialStatus() {
     t.commandedRpm
   );
   if (t.measuredRpmValid) Serial.printf("meas=%.0frpm ", t.measuredRpm);
-  Serial.printf("Hall=%.0frpm quiet=%lums watchdog=%d Iq=%.3fA Id=%.3fA latched=%d fault=%s\n",
+  Serial.printf("Hall=%.0frpm quiet=%lums watchdog=%d gap=%luus S=%d Iq=%.3fA Id=%.3fA latched=%d fault=%s\n",
                 t.hallRpm, (unsigned long)t.hallQuietMs, t.hallWatchdogEnabled,
-                t.iqA, t.idA, t.faultLatched, t.fault);
+                (unsigned long)t.loopGapUs, t.sCurveActive, t.iqA, t.idA,
+                t.faultLatched, t.fault);
+  Serial.printf("Uq=%.3fV Ud=%.3fV\n", t.uqV, t.udV);
 }
 
 void handleSerial() {
@@ -1946,25 +2249,15 @@ void handleSerial() {
       } else if (s == "stop" || s == "x") {
         retryPolicy.cancel();
         requestedPercent = 0.0f;
-        Serial.println("Stop requested");
+        Serial.println("Smooth S-curve stop requested");
+      } else if (s == "kill") {
+        retryPolicy.cancel();
+        requestedPercent = 0.0f;
+        resetSCurve(0.0f);
+        disableMotorNow();
+        Serial.println("KILL: driver disabled immediately");
       } else if (s == "clear") {
         clearSafetyFault();
-      } else if (s == "mode open") {
-        retryPolicy.cancel();
-        requestedPercent = 0.0f;
-        disableMotorNow();
-        cfg.mode = OPEN_CURRENT_FOC;
-        saveConfig();
-        Serial.println("Mode saved: OPEN_CURRENT_FOC. Restarting...");
-        scheduleRestart(500);
-      } else if (s == "mode hall") {
-        retryPolicy.cancel();
-        requestedPercent = 0.0f;
-        disableMotorNow();
-        cfg.mode = HALL_CURRENT_FOC;
-        saveConfig();
-        Serial.println("Mode saved: HALL_CURRENT_FOC. Restarting...");
-        scheduleRestart(500);
       } else if (s == "f") {
         retryPolicy.cancel();
         requestedDirection = 1;
@@ -1989,7 +2282,7 @@ void handleSerial() {
           Serial.printf("Speed request: %.0f%%\n", requestedPercent);
         }
       } else if (s.length()) {
-        Serial.println("Commands: status | mode open | mode hall | s 0..100 | f | r | stop | clear");
+        Serial.println("Commands: status | s 0..100 | f | r | stop | kill | clear");
       }
     } else if (n < sizeof(buf) - 1) {
       buf[n++] = ch;
@@ -2013,7 +2306,7 @@ void setup() {
   Serial.print("=== MaxxFan MKS ESP32 FOC Mega v");
   Serial.print(FIRMWARE_VERSION);
   Serial.println(" ===");
-  Serial.println("Required library: SimpleFOC 2.4.0");
+  Serial.println("SimpleFOC 2.4 expected");
 
   if (!prefs.begin("maxxfan", false)) {
     Serial.println("FATAL: NVS unavailable; driver disabled");
@@ -2021,23 +2314,28 @@ void setup() {
   }
   loadConfig();
 
+  // One-time repair for v0.3.4/v0.3.5 NOHALL builds that could persist
+  // HALL_CURRENT_FOC as the default mode in NVS. This commissioning build
+  // forces OPEN exactly once, then leaves future GUI mode selections alone.
+  // This is intentionally a safe migration because no Hall sensor is connected
+  // for the present commissioning setup.
+  if (!prefs.getBool("nhfix036", false)) {
+    if (cfg.mode == HALL_CURRENT_FOC) {
+      Serial.println("NVS migration v0.3.6: forcing OPEN_CURRENT_FOC once (old builds could store HALL by default).");
+      cfg.mode = OPEN_CURRENT_FOC;
+      saveConfig();
+    }
+    if (prefs.putBool("nhfix036", true) == 0) {
+      Serial.println("WARNING: could not store v0.3.6 mode-migration marker");
+    }
+  }
+
   Serial.print("Control mode: ");
   Serial.println(cfg.mode == HALL_CURRENT_FOC ? "HALL_CURRENT_FOC" : "OPEN_CURRENT_FOC");
 
-  // Clear an old experimental safety latch so a previous WINDMILL test cannot
-  // prevent this commissioning build from initializing.
   if (!ENABLE_EXPERIMENTAL_MOTION_SAFETY) prefs.putBool("safetytrip", false);
   const bool persistedFault = ENABLE_EXPERIMENTAL_MOTION_SAFETY &&
                              prefs.getBool("safetytrip", false);
-
-  // Start connectivity before any driver/current-sense/FOC initialization.
-  // If motor setup fails or takes time, MaxxFan-Setup remains reachable for
-  // diagnosis instead of leaving the browser with a connection timeout.
-  publishedConfig = cfg;
-  setupWiFi();
-  setupWebServer();
-  updateTelemetry();
-
   motorReady = setupMotor();
   if (!motorReady) disableMotorNow();
   if (persistedFault) {
@@ -2045,14 +2343,18 @@ void setup() {
     setFault("PREVIOUS_FAULT: inspect hardware, then clear manually");
   }
   publishedConfig = cfg;
+
+  setupWiFi();
+  setupWebServer();
   updateTelemetry();
 
   Serial.println("GUI recovery AP: MaxxFan-Setup / MaxxFan123");
   Serial.println("GUI URL: http://192.168.4.1  or  http://maxxfan.local");
   Serial.println("Open: http://192.168.4.1");
-  Serial.println("OPEN mode: Hall completely OFF; physical current feedback only.");
-  Serial.println("Experimental motion safety: DISABLED for commissioning.");
-  Serial.println("Serial commands: status | mode open | mode hall | s 0..100 | f | r | stop | clear");
+  Serial.printf("Safety: experimental trips %s; Hall watchdog %s; OPEN mode is Hall-independent\n",
+                ENABLE_EXPERIMENTAL_MOTION_SAFETY ? "ON" : "OFF",
+                (ENABLE_EXPERIMENTAL_MOTION_SAFETY && cfg.mode == HALL_CURRENT_FOC) ? "ON" : "OFF");
+  Serial.println("Serial commands: status | s 0..100 | f | r | stop | kill | clear");
 }
 
 void loop() {
@@ -2066,6 +2368,7 @@ void loop() {
 
   if (scheduledRestartAtMs && (int32_t)(millis() - scheduledRestartAtMs) >= 0) {
     requestedPercent = 0.0f;
+    resetSCurve(0.0f);
     disableMotorNow();
     delay(20);
     ESP.restart();
