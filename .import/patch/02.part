@@ -1,0 +1,4 @@
+unsigned long)dynCfg.startupBoostMs, cfg.currentLimitA);
+   Serial.println("Serial commands: status | s 0..100 | f | r | stop | kill | clear");
+ }
+ 
