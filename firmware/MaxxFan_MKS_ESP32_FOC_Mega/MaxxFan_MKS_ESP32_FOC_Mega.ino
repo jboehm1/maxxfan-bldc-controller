@@ -1,6 +1,6 @@
 /*
   ============================================================================
-  MaxxFan BLDC Controller - v0.4.0-dynamic.1 (dynamic current)
+  MaxxFan BLDC Controller - v0.4.0-dynamic.2 (dynamic current)
   Board : MKS ESP32 FOC Mega (single motor)
   Motor : StepperOnline 57BYA54-12-01
   Library: SimpleFOC 2.4.0
@@ -57,6 +57,7 @@
 //   'Telemetry' does not name a type
 struct Config;
 struct Telemetry;
+struct DynamicCurrentConfig;
 
 // ============================================================================
 // Local retry policy (kept in this .ino: no extra header/library required)
@@ -223,7 +224,7 @@ static constexpr bool ENABLE_EXPERIMENTAL_MOTION_SAFETY = false;
 static const char* AP_SSID = "MaxxFan-Setup";
 static const char* AP_PASSWORD = "MaxxFan123";   // >= 8 characters
 
-static constexpr const char* FIRMWARE_VERSION = "0.4.0-dynamic.1";
+static constexpr const char* FIRMWARE_VERSION = "0.4.0-dynamic.2";
 
 // AP is always enabled, so 192.168.4.1 remains a recovery path.
 // Optional home Wi-Fi credentials are entered in the GUI and stored in NVS.
