@@ -1,6 +1,6 @@
 /*
   ============================================================================
-  MaxxFan BLDC Controller - v0.4.0-dynamic.2 (dynamic current)
+  MaxxFan BLDC Controller - v0.4.0-gui.5 SAFE-MINIMAL-GUI
   Board : MKS ESP32 FOC Mega (single motor)
   Motor : StepperOnline 57BYA54-12-01
   Library: SimpleFOC 2.4.0
@@ -224,7 +224,7 @@ static constexpr bool ENABLE_EXPERIMENTAL_MOTION_SAFETY = false;
 static const char* AP_SSID = "MaxxFan-Setup";
 static const char* AP_PASSWORD = "MaxxFan123";   // >= 8 characters
 
-static constexpr const char* FIRMWARE_VERSION = "0.4.0-dynamic.2";
+static constexpr const char* FIRMWARE_VERSION = "0.4.0-gui.5";
 
 // AP is always enabled, so 192.168.4.1 remains a recovery path.
 // Optional home Wi-Fi credentials are entered in the GUI and stored in NVS.
@@ -276,7 +276,7 @@ Config makeDefaultConfig() {
   // Hall is enabled only after explicitly selecting HALL_CURRENT_FOC. 
   c.maxRpm = 600.0f;
   c.minRpm = 120.0f;
-  c.accelRpmPerSec = 350.0f;
+  c.accelRpmPerSec = c.maxRpm / 4.0f;  // ~4 s default 0->100% ramp
 
   c.currentLimitA = 0.60f;
   c.motorVoltageLimitV = 3.0f;
@@ -1826,198 +1826,24 @@ void setupWiFi() {
 // ============================================================================
 
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MaxxFan FOC</title>
-<style>
-:root{color-scheme:dark;--bg:#101318;--card:#1a2028;--line:#303946;--txt:#eef3f7;--muted:#99a8b8;--good:#65d49c;--warn:#ffbf69;--bad:#ff6b6b;--accent:#65a8ff}
-*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--txt);margin:0;padding:18px}.wrap{max-width:900px;margin:auto}h1{font-size:1.6rem;margin:0 0 4px}.sub{color:var(--muted);margin-bottom:18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}.label{font-size:.78rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}.value{font-size:1.25rem;margin-top:5px}.section{margin-top:14px}.section h2{font-size:1.05rem;margin:0 0 12px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.grow{flex:1;min-width:190px}button{border:1px solid var(--line);background:#252d38;color:var(--txt);border-radius:10px;padding:10px 14px;font-weight:650;cursor:pointer}button.primary{background:#245fa8}button.stop{background:#8d3030}button.active{outline:2px solid var(--accent)}input,select{width:100%;background:#10151b;border:1px solid var(--line);color:var(--txt);border-radius:9px;padding:9px}input[type=range]{padding:0}.formgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}.field label{display:block;color:var(--muted);font-size:.82rem;margin:0 0 5px}.note{font-size:.82rem;color:var(--muted);line-height:1.45}.msg{min-height:1.3em;color:var(--good);margin-top:8px}.fault{color:var(--bad);font-weight:700}.pill{display:inline-block;padding:3px 8px;border-radius:999px;font-size:.78rem;background:#252d38}.big{font-size:1.35rem;font-weight:700}.split{display:grid;grid-template-columns:1.3fr .7fr;gap:10px}@media(max-width:650px){.split{grid-template-columns:1fr}}
-</style>
-</head>
-<body><div class="wrap">
-<h1>MaxxFan BLDC Controller</h1>
-<div class="sub">MKS ESP32 FOC Mega · SimpleFOC 2.4 · physical current feedback</div>
-
-<div class="grid">
- <div class="card"><div class="label">Mode</div><div id="modeCard" class="value">-</div></div>
- <div class="card"><div class="label">Motor</div><div id="motorCard" class="value">-</div></div>
- <div class="card"><div class="label">Commanded</div><div id="cmdRpm" class="value">0 rpm</div></div>
- <div class="card"><div class="label">Measured</div><div id="measRpm" class="value">-</div></div>
- <div class="card"><div class="label">Iq request / measured</div><div id="curr" class="value">0 / 0 A</div></div>
- <div class="card"><div class="label">Uq / Ud</div><div id="volt" class="value">0 / 0 V</div></div>
- <div class="card"><div class="label">Wi-Fi</div><div id="wifi" class="value">AP</div></div>
-</div>
-
-<div class="card section">
- <h2>Fan control</h2>
- <div class="split">
-  <div>
-   <div class="row"><div class="big"><span id="speedText">0</span>%</div><div class="pill" id="rpmScale">max 600 rpm</div></div>
-   <input id="speed" type="range" min="0" max="100" step="1" value="0">
-  </div>
-  <div class="row">
-   <button id="fwd" class="active" onclick="setDir(1)">Forward</button>
-   <button id="rev" onclick="setDir(-1)">Reverse</button>
-   <button class="stop" onclick="stopNow()">STOP</button>
-  </div>
- </div>
- <div id="fault" class="fault"></div>
- <div class="row" style="margin-top:8px"><button id="clearFaultBtn" style="display:none" onclick="clearFaultNow()">Clear fault</button></div>
- <div id="ctrlMsg" class="msg"></div>
-</div>
-
-<div class="card section">
- <h2>Safety watchdog</h2>
- <div class="grid">
-  <div><div class="label">Hall watchdog</div><div id="hallWatch" class="value">-</div></div>
-  <div><div class="label">Hall RPM</div><div id="hallRpm" class="value">0 rpm</div></div>
-  <div><div class="label">Hall quiet</div><div id="hallQuiet" class="value">0 ms</div></div>
-  <div><div class="label">Loop gap (200 ms max)</div><div id="loopGap" class="value">0 us</div></div>
-  <div><div class="label">Fault latch</div><div id="faultLatch" class="value">CLEAR</div></div>
- </div>
- <div class="note" style="margin-top:10px">In OPEN mode Hall is completely unused. In HALL mode, a hard stall or persistent low-RPM/high-current overload disables the driver immediately and latches the fault.</div>
-</div>
-
-<div class="card section">
- <h2>Motor settings</h2>
- <div class="formgrid">
-  <div class="field"><label>Mode</label><select id="mode"><option value="0">Open-loop + real current FOC</option><option value="1">Hall closed-loop + current FOC</option></select></div>
-  <div class="field"><label>Max RPM</label><input id="maxRpm" type="number" step="10"></div>
-  <div class="field"><label>Minimum running RPM</label><input id="minRpm" type="number" step="10"></div>
-  <div class="field"><label>Full 0→100% S-curve time (s)</label><input id="rampTime" type="number" min="0.25" max="8" step="0.1"></div>
-  <div class="field"><label>Current limit A (hard max 2 A)</label><input id="currentLimit" type="number" step="0.05"></div>
-  <div class="field"><label>Dynamic OPEN current</label><select id="dynamicEnabled"><option value="1">Enabled</option><option value="0">Disabled (fixed current)</option></select></div>
-  <div class="field"><label>Dynamic minimum run current A</label><input id="dynamicMin" type="number" step="0.01"></div>
-  <div class="field"><label>Dynamic curve exponent</label><input id="dynamicExponent" type="number" step="0.1"></div>
-  <div class="field"><label>Startup boost current A</label><input id="startupBoost" type="number" step="0.05"></div>
-  <div class="field"><label>Startup boost fade ms</label><input id="startupBoostMs" type="number" step="50"></div>
-  <div class="field"><label>Motor voltage limit V (hard max 3 V)</label><input id="voltageLimit" type="number" step="0.1"></div>
-  <div class="field"><label>FOC alignment voltage V (current sense / Hall)</label><input id="alignVoltage" type="number" step="0.05"></div>
-  <div class="field"><label>Current PI - P</label><input id="currentP" type="number" step="0.01"></div>
-  <div class="field"><label>Current PI - I</label><input id="currentI" type="number" step="1"></div>
-  <div class="field"><label>Current LPF Tf s</label><input id="currentTf" type="number" step="0.0005"></div>
-  <div class="field"><label>Hall velocity PI - P</label><input id="velocityP" type="number" step="0.001"></div>
-  <div class="field"><label>Hall velocity PI - I</label><input id="velocityI" type="number" step="0.01"></div>
-  <div class="field"><label>Hall velocity LPF Tf s</label><input id="velocityTf" type="number" step="0.005"></div>
- </div>
- <div class="row" style="margin-top:12px">
-  <button class="primary" onclick="saveSettings()">Apply & save</button>
-  <button onclick="recalHall()">Recalibrate Hall</button>
-  <button onclick="resetDefaults()">Safe defaults</button>
-  <button onclick="restartEsp()">Restart</button>
- </div>
- <div class="note" style="margin-top:10px">Changing control mode restarts the ESP32. Hall recalibration also restarts and may move the motor briefly during FOC alignment. In OPEN mode the same alignment-voltage setting is used only for current-sense phase/sign alignment; Hall remains unused. The fan boots without a run command, but electrical alignment can move it briefly.</div>
- <div id="settingsMsg" class="msg"></div>
-</div>
-
-<div class="card section">
- <h2>Home Wi-Fi (optional)</h2>
- <div class="formgrid">
-  <div class="field"><label>SSID</label><input id="ssid" list="wifiList" maxlength="32" autocomplete="off"><datalist id="wifiList"></datalist></div>
-  <div class="field"><label>Password</label><input id="pass" type="password" maxlength="64" autocomplete="new-password"></div>
- </div>
- <div class="row" style="margin-top:12px">
-  
-  <button class="primary" onclick="saveWifi()">Save Wi-Fi & restart</button>
- </div>
- <div id="scanMsg" class="msg"></div>
- <div class="note" style="margin-top:10px">Enter the network SSID manually. Radio scans are disabled. Recovery AP is always available: <b>MaxxFan-Setup</b> / <b>MaxxFan123</b>, normally at <b>192.168.4.1</b>. You can also try <b>maxxfan.local</b>. The saved home password is never returned by the status API.</div>
- <div id="wifiMsg" class="msg"></div>
-</div>
-
-<div class="card section note">
- <b>Current mode note:</b> OPEN mode has real phase-current feedback but no rotor-angle feedback. Dynamic current changes the q-current request from commanded RPM; it does not measure real RPM or actual load. HALL mode remains unchanged. All normal speed changes use the monotonic quintic S-curve, and the GUI makes no periodic network requests while the motor is active.<br><br>
- <span id="extra"></span>
-</div>
-</div>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MaxxFan</title><style>
+body{font-family:system-ui,sans-serif;max-width:520px;margin:24px auto;padding:0 16px;background:#111;color:#eee}.card{background:#1d1d1d;border:1px solid #333;border-radius:14px;padding:18px;margin:14px 0}h1{font-size:24px;margin:0 0 6px}.sub{color:#aaa;font-size:13px}.value{font-size:42px;font-weight:700;text-align:center;margin:12px 0}input[type=range]{width:100%;height:36px}button{font:inherit;padding:12px 15px;margin:5px;border:0;border-radius:10px;background:#333;color:#fff}button.primary{background:#555}.row{display:flex;flex-wrap:wrap;justify-content:center}.status{min-height:22px;text-align:center;color:#aaa;margin-top:10px}
+</style></head><body>
+<div class="card"><h1>MaxxFan BLDC</h1><div class="sub">v0.4.0-gui.5 · minimal GUI · no automatic polling</div></div>
+<div class="card"><div id="val" class="value">0%</div><input id="speed" type="range" min="0" max="100" step="1" value="0">
+<div class="row"><button onclick="preset(25)">25%</button><button onclick="preset(50)">50%</button><button onclick="preset(75)">75%</button><button class="primary" onclick="preset(100)">MAX 100%</button></div>
+<div class="row"><button id="fwd" class="primary" onclick="setDir(1)">Forward</button><button id="rev" onclick="setDir(-1)">Reverse</button><button onclick="stopFan()">STOP</button></div>
+<div id="msg" class="status">Ready — network command only on slider release or button press.</div></div>
 <script>
-let dir=1, first=true, timer=null, refreshTimer=null, fullRampMs=1800;
-let controlBusy=false, controlDirty=false;
-const $=id=>document.getElementById(id);
-function enc(o){return Object.entries(o).map(([k,v])=>encodeURIComponent(k)+'='+encodeURIComponent(v)).join('&')}
-async function post(url,obj){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-MaxxFan-Control':'1'},body:enc(obj)});return await r.text()}
-function stopRefresh(){if(refreshTimer!==null){clearTimeout(refreshTimer);refreshTimer=null}}
-function scheduleRefresh(ms){stopRefresh();if(ms>0)refreshTimer=setTimeout(refresh,ms)}
-function setDirUI(){$('fwd').classList.toggle('active',dir===1);$('rev').classList.toggle('active',dir===-1)}
-function setDir(d){clearTimeout(timer);dir=d;setDirUI();queueControl()}
-function queueControl(){stopRefresh();controlDirty=true;flushControl()}
-async function flushControl(){
- if(controlBusy)return;
- controlBusy=true;
- try{
-  while(controlDirty){
-   controlDirty=false;
-   const sp=Number($('speed').value), d=dir;
-   try{await post('/api/control',{speed:sp,dir:d})}catch(e){$('fault').textContent='GUI command connection lost'}
-  }
- }finally{controlBusy=false}
-}
-$('speed').addEventListener('input',()=>{$('speedText').textContent=$('speed').value});
-$('speed').addEventListener('change',()=>{clearTimeout(timer);queueControl()});
-async function stopNow(){
- clearTimeout(timer);stopRefresh();controlDirty=false;
- $('speed').value=0;$('speedText').textContent=0;
- try{await post('/api/stop',{});$('ctrlMsg').textContent='Smooth stop requested'}catch(e){$('fault').textContent='STOP connection lost'}
- // No network traffic during the S-curve. Refresh only after the worst-case
- // full ramp time plus margin, when the driver should already be disabled.
- scheduleRefresh(fullRampMs+700);
-}
-async function clearFaultNow(){clearTimeout(timer);stopRefresh();$('speed').value=0;$('speedText').textContent=0;$('ctrlMsg').textContent=await post('/api/clear-fault',{});scheduleRefresh(800)}
-function f(n,d=3){return Number(n).toFixed(d)}
-function applyStatus(s){
- $('modeCard').textContent=s.mode===1?'HALL CURRENT FOC':'OPEN CURRENT FOC';
- $('motorCard').textContent=!s.ready?'FAULT':s.retry_pending?'RETRY IN '+Math.ceil(s.retry_remaining_ms/1000)+' s':s.fault_latched?'FAULT LATCHED':s.reversing?'REVERSING / SETTLING':s.enabled?(s.scurve?'RAMPING':'RUNNING'):'STOPPED';
- $('cmdRpm').textContent=f(s.commanded_rpm,0)+' rpm';
- $('measRpm').textContent=s.measured_valid?f(s.measured_rpm,0)+' rpm':'open-loop';
- $('curr').textContent=f(s.iq_request,2)+' / '+f(s.iq,2)+' A';
- $('volt').textContent=f(s.uq,2)+' / '+f(s.ud,2)+' V';
- $('wifi').textContent=s.sta_connected?(s.sta_ip+' · '+s.rssi+' dBm'):'AP '+s.ap_ip;
- $('fault').textContent=(s.fault||'')+(s.retry_pending?' — automatic retry '+(s.retry_attempts+1)+'/3; STOP cancels':'');
- $('clearFaultBtn').style.display=s.fault_latched?'inline-block':'none';
- $('hallWatch').textContent=s.hall_watchdog?'ACTIVE':'OFF';
- $('hallRpm').textContent=s.hall_watchdog?f(s.hall_rpm,0)+' rpm':'-';
- $('hallQuiet').textContent=s.hall_watchdog?s.hall_quiet_ms+' ms':'-';
- $('loopGap').textContent=s.loop_gap_us+' us';
- $('faultLatch').textContent=s.fault_latched?'LATCHED':'CLEAR';
- $('extra').textContent=(s.dynamic_current?'Dynamic Iq active · ':'Fixed Iq · ')+'hard current '+f(s.current_limit,2)+' A · voltage limit '+f(s.voltage_limit,2)+' V · telemetry + Wi-Fi polling paused while motor runs';
- if(first){dir=s.requested_dir<0?-1:1;setDirUI();$('speed').value=Math.round(s.requested_percent);$('speedText').textContent=Math.round(s.requested_percent);first=false}
-}
-async function refresh(){
- try{
-  const s=await (await fetch('/api/status',{cache:'no-store'})).json();
-  applyStatus(s);
-  // Exactly like the known-clean 3.7 principle: do NOT generate periodic Wi-Fi
-  // traffic while PWM/control is active.
-  if(!s.enabled && !s.reversing && !s.scurve && Number(s.requested_percent)<=0.1 && !document.hidden) scheduleRefresh(2000);
- }catch(e){$('fault').textContent='GUI connection lost';if(!document.hidden)scheduleRefresh(2000)}
-}
-async function loadConfig(){
- try{const c=await (await fetch('/api/config',{cache:'no-store'})).json();
-  $('mode').value=c.mode;$('maxRpm').value=c.max_rpm;$('minRpm').value=c.min_rpm;
-  const rt=Number(c.max_rpm)/Math.max(Number(c.accel_rpm_s),1);fullRampMs=Math.max(250,Math.min(8000,rt*1000));$('rampTime').value=(fullRampMs/1000).toFixed(2);
-  $('currentLimit').value=c.current_limit;$('voltageLimit').value=c.voltage_limit;$('alignVoltage').value=c.align_voltage;
-  $('dynamicEnabled').value=c.dynamic_current_enabled?1:0;$('dynamicMin').value=c.dynamic_min_current;$('dynamicExponent').value=c.dynamic_exponent;
-  $('startupBoost').value=c.startup_boost_current;$('startupBoostMs').value=c.startup_boost_ms;
-  $('currentP').value=c.current_p;$('currentI').value=c.current_i;$('currentTf').value=c.current_tf;
-  $('velocityP').value=c.velocity_p;$('velocityI').value=c.velocity_i;$('velocityTf').value=c.velocity_tf;
-  $('rpmScale').textContent='max '+f(c.max_rpm,0)+' rpm';
- }catch(e){$('fault').textContent='Config connection lost'}
-}
-async function saveSettings(){
- const maxRpm=Math.max(Number($('maxRpm').value),1), rampTime=Math.max(Number($('rampTime').value),0.25);
- const accel=maxRpm/rampTime;
- const obj={mode:$('mode').value,maxRpm:$('maxRpm').value,minRpm:$('minRpm').value,accel,currentLimit:$('currentLimit').value,voltageLimit:$('voltageLimit').value,alignVoltage:$('alignVoltage').value,dynamicEnabled:$('dynamicEnabled').value,dynamicMin:$('dynamicMin').value,dynamicExponent:$('dynamicExponent').value,startupBoost:$('startupBoost').value,startupBoostMs:$('startupBoostMs').value,currentP:$('currentP').value,currentI:$('currentI').value,currentTf:$('currentTf').value,velocityP:$('velocityP').value,velocityI:$('velocityI').value,velocityTf:$('velocityTf').value};
- stopRefresh();$('settingsMsg').textContent=await post('/api/settings',obj)
-}
-async function recalHall(){if(confirm('Clear saved Hall calibration and restart? The motor may move during calibration.')){stopRefresh();$('settingsMsg').textContent=await post('/api/recal',{})}}
-async function resetDefaults(){if(confirm('Restore safe motor defaults? Wi-Fi credentials are kept.')){stopRefresh();$('settingsMsg').textContent=await post('/api/defaults',{})}}
-async function restartEsp(){stopRefresh();$('settingsMsg').textContent=await post('/api/restart',{})}
-async function saveWifi(){stopRefresh();$('wifiMsg').textContent=await post('/api/wifi',{ssid:$('ssid').value,pass:$('pass').value})}
-document.addEventListener('visibilitychange',()=>{if(document.hidden)stopRefresh();else refresh()});
-loadConfig();refresh();
+const s=document.getElementById('speed'),v=document.getElementById('val'),m=document.getElementById('msg');let dir=1;
+s.oninput=()=>v.textContent=s.value+'%';
+async function post(path,obj={}){const b=new URLSearchParams(obj);const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-MaxxFan-Control':'1'},body:b,cache:'no-store'});if(!r.ok)throw new Error((await r.text())||('HTTP '+r.status));return r.text()}
+async function send(){m.textContent='Sending…';try{await post('/api/control',{speed:Number(s.value),dir});m.textContent='Sent: '+s.value+'% '+(dir>0?'forward':'reverse')}catch(e){m.textContent='Error: '+e.message}}
+s.onchange=send;
+function preset(x){s.value=x;v.textContent=x+'%';send()}
+function setDir(d){dir=d;document.getElementById('fwd').className=d>0?'primary':'';document.getElementById('rev').className=d<0?'primary':'';if(Number(s.value)>0)send()}
+async function stopFan(){s.value=0;v.textContent='0%';m.textContent='Stopping…';try{await post('/api/stop');m.textContent='Smooth stop requested'}catch(e){m.textContent='Error: '+e.message}}
 </script></body></html>
 )rawliteral";
 
