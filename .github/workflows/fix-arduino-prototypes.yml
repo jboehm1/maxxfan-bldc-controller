@@ -1,0 +1,39 @@
+name: Fix Arduino prototype ordering
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-arduino-prototypes.yml'
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/dynamic-current
+      - name: Patch sketch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('firmware/MaxxFan_MKS_ESP32_FOC_Mega/MaxxFan_MKS_ESP32_FOC_Mega.ino')
+          s = p.read_text()
+          old = 'struct Config;\nstruct Telemetry;\n'
+          new = 'struct Config;\nstruct Telemetry;\nstruct DynamicCurrentConfig;\n'
+          if new not in s:
+              if old not in s:
+                  raise SystemExit('forward declaration anchor not found')
+              s = s.replace(old, new, 1)
+          s = s.replace('v0.4.0-dynamic.1 (dynamic current)', 'v0.4.0-dynamic.2 (dynamic current)', 1)
+          s = s.replace('FIRMWARE_VERSION = "0.4.0-dynamic.1"', 'FIRMWARE_VERSION = "0.4.0-dynamic.2"', 1)
+          p.write_text(s)
+          PY
+      - name: Commit fix
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add firmware/MaxxFan_MKS_ESP32_FOC_Mega/MaxxFan_MKS_ESP32_FOC_Mega.ino
+          git diff --cached --check
+          git commit -m 'Fix Arduino auto-prototype declarations; bump dynamic.2'
+          git push origin HEAD:feature/dynamic-current
