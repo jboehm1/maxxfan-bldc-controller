@@ -863,7 +863,7 @@ bool setupMotor() {
     if (ENABLE_EXPERIMENTAL_MOTION_SAFETY) {
       const uint32_t waitStart = millis();
       while (hallQuietUs() < START_QUIET_US) {
-        if (millis() - waitStart >= START_WAIT_LIMIT_MS) { {
+        if (millis() - waitStart >= START_WAIT_LIMIT_MS) {
           setFault("WINDMILL: cannot initialize Hall FOC while rotor is moving");
           return false;
         }
