@@ -1,6 +1,6 @@
 /*
   ============================================================================
-  MaxxFan BLDC Controller - v0.4.0-dev.1 (develop)
+  MaxxFan BLDC Controller - v0.4.0-fixed.1 (fixed-current diagnostic baseline)
   Board : MKS ESP32 FOC Mega (single motor)
   Motor : StepperOnline 57BYA54-12-01
   Library: SimpleFOC 2.4.0
@@ -223,7 +223,7 @@ static constexpr bool ENABLE_EXPERIMENTAL_MOTION_SAFETY = false;
 static const char* AP_SSID = "MaxxFan-Setup";
 static const char* AP_PASSWORD = "MaxxFan123";   // >= 8 characters
 
-static constexpr const char* FIRMWARE_VERSION = "0.4.0-dev.1";
+static constexpr const char* FIRMWARE_VERSION = "0.4.0-fixed.1";
 
 // AP is always enabled, so 192.168.4.1 remains a recovery path.
 // Optional home Wi-Fi credentials are entered in the GUI and stored in NVS.
@@ -275,9 +275,9 @@ Config makeDefaultConfig() {
   // Hall is enabled only after explicitly selecting HALL_CURRENT_FOC. 
   c.maxRpm = 600.0f;
   c.minRpm = 120.0f;
-  c.accelRpmPerSec = 350.0f;
+  c.accelRpmPerSec = c.maxRpm / 4.0f;  // ~4 s default full-scale ramp
 
-  c.currentLimitA = 0.60f;
+  c.currentLimitA = 1.50f;  // diagnostic fixed-current baseline
   c.motorVoltageLimitV = 3.0f;
   c.alignVoltageV = 0.60f;
 
@@ -2226,7 +2226,7 @@ void printSerialStatus() {
                 t.hallRpm, (unsigned long)t.hallQuietMs, t.hallWatchdogEnabled,
                 (unsigned long)t.loopGapUs, t.sCurveActive, t.iqA, t.idA,
                 t.faultLatched, t.fault);
-  Serial.printf("Uq=%.3fV Ud=%.3fV\n", t.uqV, t.udV);
+  Serial.printf("Uq=%.3fV Ud=%.3fV | current_limit=%.2fA\n", t.uqV, t.udV, t.currentLimitA);
 }
 
 void handleSerial() {
@@ -2313,6 +2313,21 @@ void setup() {
     while (true) delay(1000);
   }
   loadConfig();
+
+  // v0.4.0-fixed.1 diagnostic migration: apply the intended baseline exactly
+  // once so old NVS values (for example 0.60 A) cannot invalidate this test.
+  // After this one-shot migration, GUI changes remain fully editable/persistent.
+  if (!prefs.getBool("fixed041", false)) {
+    cfg.currentLimitA = 1.50f;
+    cfg.accelRpmPerSec = max(cfg.maxRpm / 4.0f, 50.0f);
+    validateConfig(cfg);
+    saveConfig();
+    if (prefs.putBool("fixed041", true) == 0) {
+      Serial.println("WARNING: could not store fixed-current baseline marker");
+    }
+    Serial.printf("[BASELINE] one-shot preset: current=%.2f A, full ramp≈%.2f s\n",
+                  cfg.currentLimitA, cfg.maxRpm / max(cfg.accelRpmPerSec, 1.0f));
+  }
 
   // One-time repair for v0.3.4/v0.3.5 NOHALL builds that could persist
   // HALL_CURRENT_FOC as the default mode in NVS. This commissioning build
